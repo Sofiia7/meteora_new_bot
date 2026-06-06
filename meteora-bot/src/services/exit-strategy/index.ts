@@ -42,8 +42,17 @@ export class ExitStrategy {
 
   private async checkAll(): Promise<void> {
     const db = getDb();
+    // Колонки в БД snake_case, а Position — camelCase: явно алиасим,
+    // иначе position.poolAddress/entryPrice будут undefined в рантайме.
     const positions = db
-      .prepare(`SELECT * FROM positions WHERE status='active'`)
+      .prepare(
+        `SELECT id, token_address AS tokenAddress, token_symbol AS tokenSymbol,
+                pool_address AS poolAddress, fee_bps AS feeBps, bin_step AS binStep,
+                entry_price AS entryPrice, sol_amount AS solAmount,
+                position_pubkey AS positionPubkey, status,
+                opened_at AS openedAt, closed_at AS closedAt, pnl_sol AS pnlSol
+         FROM positions WHERE status='active'`
+      )
       .all() as Position[];
 
     for (const pos of positions) {
@@ -65,6 +74,22 @@ export class ExitStrategy {
   }
 
   private async detectExitSignal(position: Position): Promise<ExitSignal | null> {
+    // Текущая цена — нужна и для стоп-лосса, и для индикаторов ниже.
+    const currentPrice = await this.lpManager.getCurrentPrice(position.poolAddress);
+
+    // 0. Жёсткий стоп-лосс (страховка) — высший приоритет.
+    //    Срабатывает на быстром сливе / руге / фаде, которые индикаторы не ловят.
+    if (currentPrice !== null && position.entryPrice > 0) {
+      const dropPct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+      if (dropPct <= -config.exit.stopLossPercent) {
+        return {
+          positionId: position.id,
+          reason: 'stop_loss',
+          details: `Стоп-лосс: ${dropPct.toFixed(1)}% от входа ($${currentPrice.toFixed(8)})`,
+        };
+      }
+    }
+
     // 1. Fee target check
     const feeRatio = await this.lpManager.getClaimedFeesRatio(position);
     if (feeRatio >= config.exit.feeThreshold) {
@@ -75,9 +100,8 @@ export class ExitStrategy {
       };
     }
 
-    // 2. Get current price
-    const currentPrice = await this.lpManager.getCurrentPrice(position.poolAddress);
-    if (!currentPrice) return null;
+    // 2. Для индикаторных проверок ниже нужна цена
+    if (currentPrice === null) return null;
 
     // Update price history
     const history = this.getHistory(position.id);
