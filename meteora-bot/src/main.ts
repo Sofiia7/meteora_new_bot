@@ -3,11 +3,15 @@ import fs from 'fs';
 import { logger } from './shared/logger';
 import { config, isMainnetTradingEnabled } from './shared/config';
 import { getDb } from './shared/db';
+import { Positions, Tokens, WatchedTokens } from './shared/repositories';
+// getDb() здесь нужен только для побочного эффекта — init схемы.
+// Сами SQL-запросы идут через репозитории.
 import { ScannerService } from './services/scanner';
 import { SecurityChecker } from './services/security';
 import { PoolWatcher } from './services/pool-watcher';
 import { LpManager } from './services/lp-manager';
 import { ExitStrategy } from './services/exit-strategy';
+import { PanicDetector } from './services/panic-detector';
 import { TelegramBot } from './bot';
 import { TokenInfo, PoolInfo } from './shared/types';
 
@@ -52,6 +56,7 @@ async function main(): Promise<void> {
   const lpManager = new LpManager();
   const tgBot = new TelegramBot();
   const exitStrategy = new ExitStrategy(lpManager, scanner);
+  const panicDetector = new PanicDetector(lpManager, scanner, exitStrategy);
 
   printStartupBanner(lpManager.getWalletAddress());
 
@@ -60,34 +65,20 @@ async function main(): Promise<void> {
   scanner.onToken(async (token: TokenInfo) => {
     logger.info(`Processing token: ${token.symbol} (${token.address})`);
 
-    // Save to DB
-    db.prepare(
-      `INSERT OR IGNORE INTO tokens (address, symbol, name, market_cap, volume_24h, price_usd, ath)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(token.address, token.symbol, token.name, token.marketCap, token.volume24h, token.priceUsd, token.ath);
+    Tokens.upsert(token);
 
-    // Security check
     const secResult = await security.check(token.address);
+    Tokens.setSecurity(token.address, secResult.passed, secResult.warnings);
 
-    // Update DB with security result
-    db.prepare(
-      `UPDATE tokens SET security_passed=?, security_warnings=? WHERE address=?`
-    ).run(
-      secResult.passed ? 1 : 0,
-      JSON.stringify(secResult.warnings),
-      token.address
-    );
-
-    // Notify Telegram
     await tgBot.notifyNewToken(token, secResult);
 
     if (!secResult.passed) {
-      // If security failed, send inline button "Войти несмотря на предупреждения"
+      // Telegram-кнопка force_enter подключается в Фазе 5; пока — текстовое
+      // приглашение, пользователь может ответить /scan force:<CA>.
       await tgBot.sendMessage(
         `⚠️ Токен *${token.symbol}* не прошёл проверку безопасности\\.\n` +
-          `Хотите всё равно наблюдать за пулом?`
+          `Чтобы всё равно отслеживать пул — ответьте: \`/scan force:${token.address}\``
       );
-      // The force_enter callback is already set up in bot — it triggers manual pool watch
       return;
     }
 
@@ -96,11 +87,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Start watching for pool
-    db.prepare(
-      `INSERT INTO watched_tokens (token_address, token_symbol, status) VALUES (?, ?, 'watching')`
-    ).run(token.address, token.symbol);
-
+    WatchedTokens.insertWatching(token.address, token.symbol);
     poolWatcher.watch(token.address, token.symbol);
   });
 
@@ -114,9 +101,7 @@ async function main(): Promise<void> {
   });
 
   poolWatcher.onTimeout(async (tokenAddress, tokenSymbol) => {
-    db.prepare(
-      `UPDATE watched_tokens SET status='timed_out' WHERE token_address=? AND status='watching'`
-    ).run(tokenAddress);
+    WatchedTokens.setStatus(tokenAddress, 'watching', 'timed_out');
     await tgBot.notifyPoolTimeout(tokenAddress, tokenSymbol);
   });
 
@@ -132,10 +117,7 @@ async function main(): Promise<void> {
     }
 
     poolWatcher.stopWatching(tokenAddress);
-
-    db.prepare(
-      `UPDATE watched_tokens SET status='entered' WHERE token_address=? AND status='watching'`
-    ).run(tokenAddress);
+    WatchedTokens.setStatus(tokenAddress, 'watching', 'entered');
 
     const position = await lpManager.openPosition(tokenAddress, symbol, pool);
     if (position) {
@@ -189,16 +171,10 @@ async function main(): Promise<void> {
 
   tgBot.onContinueWatching = (tokenAddress, continueWatching) => {
     if (continueWatching) {
-      const db2 = getDb();
-      const row = db2
-        .prepare(`SELECT token_symbol FROM watched_tokens WHERE token_address=? ORDER BY id DESC LIMIT 1`)
-        .get(tokenAddress) as { token_symbol: string } | undefined;
-      const symbol = row?.token_symbol ?? tokenAddress.slice(0, 8);
+      const symbol = WatchedTokens.latestSymbol(tokenAddress) ?? tokenAddress.slice(0, 8);
       poolWatcher.watch(tokenAddress, symbol);
     } else {
-      db.prepare(
-        `UPDATE watched_tokens SET status='cancelled' WHERE token_address=? AND status='watching'`
-      ).run(tokenAddress);
+      WatchedTokens.setStatus(tokenAddress, 'watching', 'cancelled');
     }
   };
 
@@ -207,10 +183,7 @@ async function main(): Promise<void> {
   tgBot.onExitPosition = async (positionId: number) => {
     exitStrategy.clearHistory(positionId);
     const result = await lpManager.closePosition(positionId);
-    const db2 = getDb();
-    const position = db2
-      .prepare(`SELECT * FROM positions WHERE id=?`)
-      .get(positionId) as any;
+    const position = Positions.findById(positionId);
     if (result && position) {
       position.pnlSol = result.pnlSol;
       await tgBot.notifyPositionClosed(position, 'manual');
@@ -219,19 +192,25 @@ async function main(): Promise<void> {
     }
   };
 
-  // ─── Exit Strategy signals ────────────────────────────────────────────────
+  // ─── Exit Strategy / Panic Detector signals (общая шина) ──────────────────
 
-  exitStrategy.onExit(async (signal) => {
+  const handleAutoExit = async (signal: import('./shared/types').ExitSignal): Promise<void> => {
     exitStrategy.clearHistory(signal.positionId);
+    panicDetector.clearState(signal.positionId);
     const result = await lpManager.closePosition(signal.positionId);
-    const db2 = getDb();
-    const position = db2
-      .prepare(`SELECT * FROM positions WHERE id=?`)
-      .get(signal.positionId) as any;
+    const position = Positions.findById(signal.positionId);
     if (result && position) {
       position.pnlSol = result.pnlSol;
       await tgBot.notifyPositionClosed(position, signal.reason);
     }
+  };
+
+  exitStrategy.onExit(handleAutoExit);
+  panicDetector.onExit(handleAutoExit);
+
+  // Деградация графика — НЕ авто-выход, а предупреждение с кнопкой.
+  exitStrategy.onDegradationWarning(async (w) => {
+    await tgBot.notifyDegradation(w.positionId, w.tokenSymbol, w.message);
   });
 
   // ─── Start all services ───────────────────────────────────────────────────
@@ -239,6 +218,7 @@ async function main(): Promise<void> {
   tgBot.start();
   scanner.start();
   exitStrategy.start();
+  panicDetector.start();
 
   logger.info('All services started');
   const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY\\_RUN';
@@ -255,6 +235,7 @@ async function main(): Promise<void> {
     logger.info('Shutting down...');
     scanner.stop();
     exitStrategy.stop();
+    panicDetector.stop();
     tgBot.stop();
     process.exit(0);
   }

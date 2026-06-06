@@ -1,22 +1,48 @@
 import { BollingerBands, RSI } from 'technicalindicators';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
-import { getDb } from '../../shared/db';
+import { Positions, recordSignal } from '../../shared/repositories';
 import { Position, ExitSignal } from '../../shared/types';
 import { LpManager } from '../lp-manager';
 import { ScannerService } from '../scanner';
 
 type ExitCallback = (signal: ExitSignal) => void;
 
+export interface DegradationWarning {
+  positionId: number;
+  tokenSymbol: string;
+  rsi: number;
+  volume24h: number;
+  message: string;
+}
+type WarningCallback = (w: DegradationWarning) => void;
+
 interface PriceHistory {
   prices: number[];
   ath: number;
+  /** ATH, при котором мы в последний раз сигналили выход "new_ath". */
+  lastSignalledAth: number;
 }
 
+/**
+ * Exit monitor — отвечает за тейк-профиты:
+ *   • BB-пробой (15м-эквивалент),
+ *   • новый ATH ≥ +N% над прошлым signalled-ATH,
+ *   • достижение целевой доли комиссий.
+ *
+ * Сценарий «полная картина пиздеца» (auto-panic) — это отдельный модуль
+ * `panic-detector` (Фаза 1.5). Здесь авто-выхода по single-factor НЕТ.
+ *
+ * Деградация графика (RSI + объём) — только предупреждение через
+ * `onDegradationWarning`, без авто-закрытия.
+ *
+ * Ценовой стоп-лосс — отключён по умолчанию (`ENABLE_PRICE_STOP_LOSS=false`).
+ */
 export class ExitStrategy {
   private priceHistory = new Map<number, PriceHistory>();
   private intervalHandle: NodeJS.Timeout | null = null;
-  private callbacks: ExitCallback[] = [];
+  private exitCallbacks: ExitCallback[] = [];
+  private warningCallbacks: WarningCallback[] = [];
 
   constructor(
     private lpManager: LpManager,
@@ -24,11 +50,14 @@ export class ExitStrategy {
   ) {}
 
   onExit(cb: ExitCallback): void {
-    this.callbacks.push(cb);
+    this.exitCallbacks.push(cb);
+  }
+
+  onDegradationWarning(cb: WarningCallback): void {
+    this.warningCallbacks.push(cb);
   }
 
   start(): void {
-    // Check every 60 seconds
     this.intervalHandle = setInterval(() => this.checkAll(), 60_000);
     logger.info('Exit strategy monitor started');
   }
@@ -40,21 +69,14 @@ export class ExitStrategy {
     }
   }
 
-  private async checkAll(): Promise<void> {
-    const db = getDb();
-    // Колонки в БД snake_case, а Position — camelCase: явно алиасим,
-    // иначе position.poolAddress/entryPrice будут undefined в рантайме.
-    const positions = db
-      .prepare(
-        `SELECT id, token_address AS tokenAddress, token_symbol AS tokenSymbol,
-                pool_address AS poolAddress, fee_bps AS feeBps, bin_step AS binStep,
-                entry_price AS entryPrice, sol_amount AS solAmount,
-                position_pubkey AS positionPubkey, status,
-                opened_at AS openedAt, closed_at AS closedAt, pnl_sol AS pnlSol
-         FROM positions WHERE status='active'`
-      )
-      .all() as Position[];
+  /** Доступ к истории цен для panic-detector (Фаза 1.5). */
+  getPriceSnapshot(positionId: number): { prices: number[]; ath: number } | null {
+    const h = this.priceHistory.get(positionId);
+    return h ? { prices: [...h.prices], ath: h.ath } : null;
+  }
 
+  private async checkAll(): Promise<void> {
+    const positions = Positions.findActive();
     for (const pos of positions) {
       await this.checkPosition(pos);
     }
@@ -65,8 +87,8 @@ export class ExitStrategy {
       const signal = await this.detectExitSignal(position);
       if (signal) {
         logger.info(`Exit signal for position ${position.id}: ${signal.reason}`);
-        db_recordSignal(position.id, signal.reason, signal.details);
-        for (const cb of this.callbacks) cb(signal);
+        recordSignal(position.id, signal.reason, signal.details);
+        for (const cb of this.exitCallbacks) cb(signal);
       }
     } catch (err) {
       logger.error(`Exit check error for position ${position.id}: ${err}`);
@@ -74,12 +96,16 @@ export class ExitStrategy {
   }
 
   private async detectExitSignal(position: Position): Promise<ExitSignal | null> {
-    // Текущая цена — нужна и для стоп-лосса, и для индикаторов ниже.
     const currentPrice = await this.lpManager.getCurrentPrice(position.poolAddress);
 
-    // 0. Жёсткий стоп-лосс (страховка) — высший приоритет.
-    //    Срабатывает на быстром сливе / руге / фаде, которые индикаторы не ловят.
-    if (currentPrice !== null && position.entryPrice > 0) {
+    // 0. Ценовой стоп-лосс — отключён по умолчанию (решение заказчика:
+    //    жёсткие SL дают слишком много ложных выбиваний на волатильности
+    //    мемов; защита от руга — composite panic-detector + ручная кнопка).
+    if (
+      config.exit.enablePriceStopLoss &&
+      currentPrice !== null &&
+      position.entryPrice > 0
+    ) {
       const dropPct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
       if (dropPct <= -config.exit.stopLossPercent) {
         return {
@@ -90,8 +116,8 @@ export class ExitStrategy {
       }
     }
 
-    // 1. Fee target check
-    const feeRatio = await this.lpManager.getClaimedFeesRatio(position);
+    // 1. Fee target — авто-выход (тейк-профит).
+    const feeRatio = await this.lpManager.getFeesRatio(position);
     if (feeRatio >= config.exit.feeThreshold) {
       return {
         positionId: position.id,
@@ -100,39 +126,40 @@ export class ExitStrategy {
       };
     }
 
-    // 2. Для индикаторных проверок ниже нужна цена
     if (currentPrice === null) return null;
 
-    // Update price history
     const history = this.getHistory(position.id);
     history.prices.push(currentPrice);
-    if (currentPrice > history.ath) {
-      history.ath = currentPrice;
-    }
-    // Keep last 50 candles
     if (history.prices.length > 50) history.prices.shift();
 
-    // 3. New ATH check (>5% above previous ATH)
-    const prevAth = history.ath;
-    if (history.prices.length > 5 && currentPrice > prevAth * 1.05) {
+    // 2. New ATH — авто-выход (тейк-профит).
+    //    Раньше код бампил history.ath ДО сравнения → условие никогда не срабатывало.
+    //    Сейчас: сравниваем с lastSignalledAth (или ath, если ещё не сигналили).
+    const referenceAth = history.lastSignalledAth || history.ath;
+    if (
+      history.prices.length > 5 &&
+      referenceAth > 0 &&
+      currentPrice > referenceAth * 1.05
+    ) {
       history.ath = currentPrice;
+      history.lastSignalledAth = currentPrice;
       return {
         positionId: position.id,
         reason: 'new_ath',
-        details: `New ATH: $${currentPrice.toFixed(8)} (prev: $${prevAth.toFixed(8)})`,
+        details: `New ATH: $${currentPrice.toFixed(8)} (prev: $${referenceAth.toFixed(8)})`,
       };
     }
+    // Бамп ATH ПОСЛЕ проверки.
+    if (currentPrice > history.ath) history.ath = currentPrice;
 
-    // Need at least period+1 data points for indicators
     if (history.prices.length < config.exit.bollingerPeriod + 1) return null;
 
-    // 4. Bollinger Bands breakout
+    // 3. Bollinger Bands breakout — авто-выход (тейк-профит).
     const bbResult = BollingerBands.calculate({
       period: config.exit.bollingerPeriod,
       stdDev: config.exit.bollingerStdDev,
       values: history.prices,
     });
-
     if (bbResult.length > 0) {
       const lastBb = bbResult[bbResult.length - 1];
       if (currentPrice > lastBb.upper) {
@@ -144,22 +171,30 @@ export class ExitStrategy {
       }
     }
 
-    // 5. Chart degradation: RSI + volume
+    // 4. Деградация графика → ПРЕДУПРЕЖДЕНИЕ, не авто-выход.
+    //    (Решение заказчика: одна деградация — не повод выходить; авто-выход
+    //    случится, только если composite panic-detector соберёт ≥ N факторов.)
     if (history.prices.length >= 14) {
       const rsiResult = RSI.calculate({ period: 14, values: history.prices });
       const lastRsi = rsiResult[rsiResult.length - 1];
-
       if (lastRsi && lastRsi < config.exit.rsiDegradationThreshold) {
-        // Check volume degradation via DexScreener
         const tokenInfo = await this.scanner.fetchTokenInfo(position.tokenAddress);
         if (tokenInfo) {
-          const volumeOk = tokenInfo.volume24h >= config.scanner.minVolume24h * config.exit.volumeDegradationRatio;
-          if (!volumeOk) {
-            return {
-              positionId: position.id,
-              reason: 'chart_degradation',
-              details: `RSI: ${lastRsi.toFixed(1)}, Vol24h: $${tokenInfo.volume24h.toFixed(0)}`,
-            };
+          const volOk =
+            tokenInfo.volume24h >=
+            config.scanner.minVolume24h * config.exit.volumeDegradationRatio;
+          if (!volOk) {
+            for (const cb of this.warningCallbacks) {
+              cb({
+                positionId: position.id,
+                tokenSymbol: position.tokenSymbol,
+                rsi: lastRsi,
+                volume24h: tokenInfo.volume24h,
+                message:
+                  `RSI ${lastRsi.toFixed(1)} ниже ${config.exit.rsiDegradationThreshold}, ` +
+                  `Vol24h $${tokenInfo.volume24h.toFixed(0)} ниже порога`,
+              });
+            }
           }
         }
       }
@@ -169,19 +204,15 @@ export class ExitStrategy {
   }
 
   private getHistory(positionId: number): PriceHistory {
-    if (!this.priceHistory.has(positionId)) {
-      this.priceHistory.set(positionId, { prices: [], ath: 0 });
+    let h = this.priceHistory.get(positionId);
+    if (!h) {
+      h = { prices: [], ath: 0, lastSignalledAth: 0 };
+      this.priceHistory.set(positionId, h);
     }
-    return this.priceHistory.get(positionId)!;
+    return h;
   }
 
   clearHistory(positionId: number): void {
     this.priceHistory.delete(positionId);
   }
-}
-
-function db_recordSignal(positionId: number, reason: string, details: string): void {
-  const db = getDb();
-  db.prepare(`INSERT INTO signals (position_id, reason, details) VALUES (?, ?, ?)`)
-    .run(positionId, reason, details);
 }

@@ -34,7 +34,7 @@ export interface PoolInfo {
   currentPrice: number;
 }
 
-export type PositionStatus = 'watching' | 'active' | 'closed';
+export type PositionStatus = 'watching' | 'active' | 'closing' | 'closed';
 
 export interface Position {
   id: number;
@@ -60,7 +60,14 @@ export interface WatchedToken {
   status: 'watching' | 'found_pool' | 'entered' | 'timed_out' | 'cancelled';
 }
 
-export type ExitReason = 'stop_loss' | 'bollinger_breakout' | 'new_ath' | 'fee_target' | 'chart_degradation' | 'manual';
+export type ExitReason =
+  | 'stop_loss'
+  | 'bollinger_breakout'
+  | 'new_ath'
+  | 'fee_target'
+  | 'chart_degradation'
+  | 'panic_composite'
+  | 'manual';
 
 export interface ExitSignal {
   positionId: number;

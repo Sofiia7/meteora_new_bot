@@ -5,6 +5,7 @@ import {
   LAMPORTS_PER_SOL,
   VersionedTransaction,
   Transaction,
+  ComputeBudgetProgram,
 } from '@solana/web3.js';
 import DLMM, { LbPosition, StrategyType } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
@@ -12,7 +13,7 @@ import bs58 from 'bs58';
 import axios from 'axios';
 import { config, isMainnetTradingEnabled } from '../../shared/config';
 import { logger } from '../../shared/logger';
-import { getDb } from '../../shared/db';
+import { Positions } from '../../shared/repositories';
 import { PoolInfo, Position } from '../../shared/types';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -33,11 +34,7 @@ export class LpManager {
   }
 
   getActivePositionCount(): number {
-    const db = getDb();
-    const row = db
-      .prepare(`SELECT COUNT(*) as cnt FROM positions WHERE status='active'`)
-      .get() as { cnt: number };
-    return row.cnt;
+    return Positions.countActive();
   }
 
   canOpenPosition(): boolean {
@@ -105,20 +102,57 @@ export class LpManager {
       await dlmmPool.refetchStates();
 
       const activeBin = await dlmmPool.getActiveBin();
+      const activeBinId = activeBin.binId;
       const currentPrice = parseFloat(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
 
       const solAmountLamports = Math.floor(config.lp.amountSol * LAMPORTS_PER_SOL);
 
-      const lowerPriceMultiplier = 1 + config.lp.priceRangeLower / 100;
+      // Определяем, какая сторона пула — SOL. Раньше код жёстко считал SOL=Y,
+      // что на половине пулов даёт неверный side и упавшую транзакцию.
+      const xIsSol = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT;
+      const yIsSol = dlmmPool.tokenY.publicKey.toBase58() === WSOL_MINT;
+      if (!xIsSol && !yIsSol) {
+        logger.error(`Pool ${pool.address} не является SOL-парой — single-sided SOL невозможен`);
+        return null;
+      }
+
+      // Single-sided депозит «только солью» работает корректно только когда
+      // ВЕСЬ диапазон лежит по ОДНУ сторону от активного бина — со стороны,
+      // куда «вырастет цена». При покупке мемкоина другими его цена в SOL
+      // растёт; в каком направлении это «выше binId» — зависит от того, какая
+      // сторона пула SOL.
+      //   - SOL = Y (Y/X = price): рост цены мемкоина = binId растёт → ликвидность ВЫШЕ active.
+      //   - SOL = X: всё инвертировано → ликвидность НИЖЕ active.
+      // Диапазон по ТЗ: от текущей цены до +(priceRangeUpper)% — берём только
+      // верхнюю/нижнюю «полку», игнорируя priceRangeLower для single-sided
+      // (защита −90% обеспечивается тем, что наш SOL автоматически
+      // конвертируется в токен ПО ХОДУ роста, а не сразу).
       const upperPriceMultiplier = 1 + config.lp.priceRangeUpper / 100;
+      const upperBinId = dlmmPool.getBinIdFromPrice(currentPrice * upperPriceMultiplier, false);
 
-      // getBinIdFromPrice is an instance method taking (price, min) - no binStep arg
-      const minBinId = dlmmPool.getBinIdFromPrice(currentPrice * lowerPriceMultiplier, true);
-      const maxBinId = dlmmPool.getBinIdFromPrice(currentPrice * upperPriceMultiplier, false);
+      let minBinId: number;
+      let maxBinId: number;
+      let totalXAmount: BN;
+      let totalYAmount: BN;
+      if (yIsSol) {
+        // SOL = Y. Кладём Y, диапазон активный бин → upperBinId.
+        minBinId = activeBinId + 1;
+        maxBinId = Math.max(upperBinId, minBinId);
+        totalXAmount = new BN(0);
+        totalYAmount = new BN(solAmountLamports);
+      } else {
+        // SOL = X. Кладём X, диапазон lowerBinId → активный бин.
+        const lowerPriceMultiplier = 1 / upperPriceMultiplier; // зеркально
+        const lowerBinId = dlmmPool.getBinIdFromPrice(currentPrice * lowerPriceMultiplier, true);
+        maxBinId = activeBinId - 1;
+        minBinId = Math.min(lowerBinId, maxBinId);
+        totalXAmount = new BN(solAmountLamports);
+        totalYAmount = new BN(0);
+      }
 
-      // Single-sided SOL liquidity (SOL is Y token in most Meteora pairs)
-      const totalXAmount = new BN(0);
-      const totalYAmount = new BN(solAmountLamports);
+      logger.info(
+        `LP plan: SOL side=${yIsSol ? 'Y' : 'X'}, bins [${minBinId}..${maxBinId}], active=${activeBinId}`
+      );
 
       const positionKp = Keypair.generate();
 
@@ -137,26 +171,19 @@ export class LpManager {
       const signature = await this.sendTransaction(tx as Transaction, [positionKp]);
       logger.info(`Position opened: ${signature}, pubkey: ${positionKp.publicKey.toBase58()}`);
 
-      const db = getDb();
-      const result = db
-        .prepare(
-          `INSERT INTO positions
-           (token_address, token_symbol, pool_address, fee_bps, bin_step, entry_price, sol_amount, position_pubkey, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`
-        )
-        .run(
-          tokenAddress,
-          tokenSymbol,
-          pool.address,
-          pool.feeBps,
-          pool.binStep,
-          currentPrice,
-          config.lp.amountSol,
-          positionKp.publicKey.toBase58()
-        );
+      const id = Positions.insert({
+        tokenAddress,
+        tokenSymbol,
+        poolAddress: pool.address,
+        feeBps: pool.feeBps,
+        binStep: pool.binStep,
+        entryPrice: currentPrice,
+        solAmount: config.lp.amountSol,
+        positionPubkey: positionKp.publicKey.toBase58(),
+      });
 
       return {
-        id: result.lastInsertRowid as number,
+        id,
         tokenAddress,
         tokenSymbol,
         poolAddress: pool.address,
@@ -177,25 +204,35 @@ export class LpManager {
   }
 
   async closePosition(positionId: number): Promise<{ pnlSol: number } | null> {
-    const db = getDb();
-    const position = db
-      .prepare(`SELECT * FROM positions WHERE id=? AND status='active'`)
-      .get(positionId) as Position | undefined;
+    // Идемпотентность: атомарный переход active → closing. Если кто-то уже
+    // закрывает позицию (двойной клик / гонка panic+manual) — здесь второй
+    // вызов получит false и тихо выйдет.
+    if (!Positions.markClosing(positionId)) {
+      logger.info(`Position ${positionId} is not active (already closing/closed) — skip`);
+      return null;
+    }
 
+    const position = Positions.findById(positionId);
     if (!position) {
-      logger.warn(`Position ${positionId} not found or already closed`);
+      logger.warn(`Position ${positionId} disappeared after markClosing`);
       return null;
     }
 
     if (!isMainnetTradingEnabled()) {
       logger.warn(
         `[DRY_RUN] closePosition skipped for position ${positionId}. ` +
-          `Реальное закрытие отключено safety-gate'ом.`
+          `Откатываю статус active.`
       );
+      Positions.markActiveAgain(positionId);
       return null;
     }
 
     logger.info(`Closing position ${positionId} for ${position.tokenSymbol}`);
+
+    // PnL считаем по дельте SOL-баланса кошелька — это автоматически учитывает
+    // снятие ликвидности, заклеймленные fees, газ и slippage свопа. Никакого
+    // ручного сложения feeX (мемкоин) + feeY (SOL).
+    const solBalanceBefore = await this.connection.getBalance(this.wallet.publicKey);
 
     try {
       const dlmmPool = await DLMM.create(this.connection, new PublicKey(position.poolAddress));
@@ -206,61 +243,79 @@ export class LpManager {
         (p: LbPosition) => p.publicKey.toBase58() === position.positionPubkey
       );
 
-      if (userPosition) {
-        // 1. Claim fees first
-        const claimTxs = await dlmmPool.claimAllRewardsByPosition({
-          owner: this.wallet.publicKey,
-          position: userPosition,
-        });
-        for (const tx of claimTxs) {
-          await this.sendTransaction(tx as Transaction);
-        }
-        logger.info(`Fees claimed for position ${positionId}`);
-
-        // 2. Remove all liquidity
-        const { lowerBinId, upperBinId } = userPosition.positionData;
-        const removeTxs = await dlmmPool.removeLiquidity({
-          user: this.wallet.publicKey,
-          position: userPosition.publicKey,
-          fromBinId: lowerBinId,
-          toBinId: upperBinId,
-          bps: new BN(10000), // 100%
-          shouldClaimAndClose: true,
-        });
-
-        for (const tx of Array.isArray(removeTxs) ? removeTxs : [removeTxs]) {
-          await this.sendTransaction(tx as Transaction);
-        }
-        logger.info(`Liquidity removed for position ${positionId}`);
-      } else {
-        logger.warn(`Position ${positionId} not found on-chain`);
+      if (!userPosition) {
+        // Позиции нет on-chain → НИ В КОЕМ СЛУЧАЕ не свопим (раньше код свопил).
+        // Возможные причины: позиция закрыта вручную через Meteora UI, или
+        // вообще никогда не открылась (DRY_RUN-история). Фиксируем как closed
+        // с pnl=null, чтобы не дёргать её повторно.
+        logger.warn(`Position ${positionId} not found on-chain — marking closed without swap`);
+        Positions.markClosed(positionId, null);
+        return { pnlSol: 0 };
       }
 
-      // 3. Swap accumulated token → SOL via Jupiter
+      // 1. Claim fees.
+      const claimTxs = await dlmmPool.claimAllRewardsByPosition({
+        owner: this.wallet.publicKey,
+        position: userPosition,
+      });
+      for (const tx of claimTxs) {
+        await this.sendTransaction(tx as Transaction);
+      }
+      logger.info(`Fees claimed for position ${positionId}`);
+
+      // 2. Remove all liquidity.
+      const { lowerBinId, upperBinId } = userPosition.positionData;
+      const removeTxs = await dlmmPool.removeLiquidity({
+        user: this.wallet.publicKey,
+        position: userPosition.publicKey,
+        fromBinId: lowerBinId,
+        toBinId: upperBinId,
+        bps: new BN(10000),
+        shouldClaimAndClose: true,
+      });
+      for (const tx of Array.isArray(removeTxs) ? removeTxs : [removeTxs]) {
+        await this.sendTransaction(tx as Transaction);
+      }
+      logger.info(`Liquidity removed for position ${positionId}`);
+
+      // 3. Swap полученный мемкоин → SOL (если что-то осталось).
       const tokenBalance = await this.getTokenBalance(position.tokenAddress);
-      let swappedSol = 0;
       if (tokenBalance > 0) {
-        swappedSol = await this.swapTokenToSol(position.tokenAddress, tokenBalance);
-        logger.info(`Swapped ${tokenBalance} token → ${swappedSol.toFixed(4)} SOL`);
+        const got = await this.swapTokenToSol(position.tokenAddress, tokenBalance);
+        logger.info(`Swapped ${tokenBalance} token → ~${got.toFixed(4)} SOL`);
       }
 
-      // 4. PnL = swapped SOL + fees earned - initial investment
-      // Approximate: difference in SOL balance covers fees + swap proceeds
-      const pnlSol = swappedSol - position.solAmount;
+      // 4. Финальная дельта баланса.
+      const solBalanceAfter = await this.connection.getBalance(this.wallet.publicKey);
+      const pnlSol = (solBalanceAfter - solBalanceBefore) / LAMPORTS_PER_SOL - position.solAmount;
+      // ↑ position.solAmount — то, что мы УЖЕ потратили в openPosition (вошло
+      // в solBalanceBefore? — нет: solAmount был списан раньше). Поэтому:
+      //   до   = баланс ПОСЛЕ входа в позицию (минус газ входа)
+      //   после = баланс после полного exit
+      // delta = после − до = (что нам вернули LP+fees+swap) − (ничего)
+      // Это и есть «сколько SOL мы получили обратно». PnL относительно входа:
+      //   pnl = delta − solAmount
+      // (мы хотим знать «сколько заработали/потеряли поверх первоначальной 2.5 SOL»).
 
-      // 5. Update DB
-      db.prepare(
-        `UPDATE positions SET status='closed', closed_at=unixepoch(), pnl_sol=? WHERE id=?`
-      ).run(pnlSol, positionId);
-
+      Positions.markClosed(positionId, pnlSol);
       return { pnlSol };
     } catch (err) {
       logger.error(`Failed to close position ${positionId}: ${err}`);
+      // На ошибке откатываем status обратно в active, чтобы можно было
+      // попробовать ещё раз (вручную или через panic).
+      Positions.markActiveAgain(positionId);
       return null;
     }
   }
 
-  async getClaimedFeesRatio(position: Position): Promise<number> {
+  /**
+   * Доля **unclaimed** комиссий относительно вложенной SOL-позиции.
+   * Корректно приводит токеновую сторону комиссии к SOL по текущей цене пула,
+   * не складывает разные активы как раньше.
+   *
+   * Это всё ещё приближение: реальные decimals токена X берутся через RPC.
+   */
+  async getFeesRatio(position: Position): Promise<number> {
     try {
       const dlmmPool = await DLMM.create(this.connection, new PublicKey(position.poolAddress));
       await dlmmPool.refetchStates();
@@ -269,14 +324,42 @@ export class LpManager {
       const userPos = userPositions.find(
         (p: LbPosition) => p.publicKey.toBase58() === position.positionPubkey
       );
-
       if (!userPos) return 0;
 
-      const feeX = userPos.positionData.feeX.toNumber() / LAMPORTS_PER_SOL;
-      const feeY = userPos.positionData.feeY.toNumber() / LAMPORTS_PER_SOL;
-      const totalFees = feeX + feeY;
+      // Определяем какая сторона — SOL. Token Y в Meteora DLMM обычно "quote".
+      const tokenXMint = dlmmPool.tokenX.publicKey.toBase58();
+      const tokenYMint = dlmmPool.tokenY.publicKey.toBase58();
+      const xIsSol = tokenXMint === WSOL_MINT;
+      const yIsSol = tokenYMint === WSOL_MINT;
 
-      return totalFees / position.solAmount;
+      // Decimals токенов — из SDK (Meteora их кладёт в tokenX/Y).
+      const decX = (dlmmPool.tokenX as { decimal?: number }).decimal ?? 9;
+      const decY = (dlmmPool.tokenY as { decimal?: number }).decimal ?? 9;
+
+      const feeXraw = userPos.positionData.feeX.toNumber();
+      const feeYraw = userPos.positionData.feeY.toNumber();
+      const feeX = feeXraw / 10 ** decX;
+      const feeY = feeYraw / 10 ** decY;
+
+      // Цена пула: SOL за 1 token (если SOL=Y) или token за 1 SOL (если SOL=X).
+      const activeBin = await dlmmPool.getActiveBin();
+      const priceYperX = parseFloat(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
+      // priceYperX = сколько Y нужно отдать за 1 X.
+
+      let feeInSol: number;
+      if (yIsSol) {
+        // Token = X (memcoin), SOL = Y. feeX_in_SOL = feeX * priceYperX.
+        feeInSol = feeY + feeX * priceYperX;
+      } else if (xIsSol) {
+        // Token = Y (memcoin), SOL = X. feeY_in_SOL = feeY / priceYperX.
+        const priceXperY = priceYperX > 0 ? 1 / priceYperX : 0;
+        feeInSol = feeX + feeY * priceXperY;
+      } else {
+        // Не SOL-пара (странно, в нашем сценарии не должно быть). Игнорим.
+        return 0;
+      }
+
+      return feeInSol / position.solAmount;
     } catch {
       return 0;
     }
@@ -353,17 +436,73 @@ export class LpManager {
     }
   }
 
+  /**
+   * Отправка транзакции с защитой:
+   *   - Priority fee (ComputeBudgetProgram) — без него на мейннете
+   *     при волатильности мемов транзакции массово фейлятся.
+   *   - simulate() перед отправкой — ловим явные ошибки до уплаты газа.
+   *   - retry с exponential backoff на свежий blockhash.
+   *
+   * Версионные транзакции (от Jupiter и т.п.) подписываются и отправляются
+   * отдельно — здесь только legacy Transaction (Meteora DLMM SDK).
+   */
   private async sendTransaction(tx: Transaction, extraSigners: Keypair[] = []): Promise<string> {
-    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = this.wallet.publicKey;
-    tx.sign(this.wallet, ...extraSigners);
+    const MAX_ATTEMPTS = 3;
+    let lastErr: unknown = null;
 
-    const sig = await this.connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
-    await this.connection.confirmTransaction(sig, 'confirmed');
-    return sig;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        // Свежий blockhash на каждой попытке (старый может протухнуть).
+        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash(
+          'confirmed'
+        );
+
+        // Pure-функция: создаём НОВЫЙ Transaction, чтобы не множить
+        // ComputeBudget-инструкции при ретраях.
+        const builtTx = new Transaction();
+        builtTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+        builtTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+        for (const ix of tx.instructions) builtTx.add(ix);
+        builtTx.recentBlockhash = blockhash;
+        builtTx.feePayer = this.wallet.publicKey;
+        builtTx.sign(this.wallet, ...extraSigners);
+
+        // Симуляция: если SDK/программа вернёт ошибку — узнаем заранее.
+        // Не критично: если RPC отказывает в simulate, продолжаем.
+        try {
+          const sim = await this.connection.simulateTransaction(builtTx);
+          if (sim.value.err) {
+            const logs = sim.value.logs?.slice(-5).join(' | ') ?? '';
+            throw new Error(`Simulation failed: ${JSON.stringify(sim.value.err)} | ${logs}`);
+          }
+        } catch (simErr) {
+          // На некоторых RPC simulate может возвращать transient error даже
+          // при валидной tx. Если это наш бросок «Simulation failed» — пробрасываем.
+          if (simErr instanceof Error && simErr.message.startsWith('Simulation failed')) {
+            throw simErr;
+          }
+          logger.warn(`simulate() unavailable, продолжаем без проверки: ${simErr}`);
+        }
+
+        const sig = await this.connection.sendRawTransaction(builtTx.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        await this.connection.confirmTransaction(
+          { signature: sig, blockhash, lastValidBlockHeight },
+          'confirmed'
+        );
+        if (attempt > 1) logger.info(`tx ${sig} confirmed on attempt ${attempt}`);
+        return sig;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = 1000 * 2 ** (attempt - 1); // 1s, 2s
+          logger.warn(`sendTransaction attempt ${attempt} failed: ${err}. Retrying in ${delay}ms`);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+    }
+    throw new Error(`sendTransaction failed after ${MAX_ATTEMPTS} attempts: ${lastErr}`);
   }
 }

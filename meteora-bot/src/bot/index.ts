@@ -1,7 +1,7 @@
 import { Telegraf, Markup, Context } from 'telegraf';
 import { config } from '../shared/config';
 import { logger } from '../shared/logger';
-import { getDb } from '../shared/db';
+import { Positions, WatchedTokens } from '../shared/repositories';
 import { SecurityResult, TokenInfo, PoolInfo, Position, ExitReason } from '../shared/types';
 
 export class TelegramBot {
@@ -151,12 +151,17 @@ export class TelegramBot {
   async notifyPositionOpened(position: Position): Promise<void> {
     const text = [
       `🟢 *Позиция открыта: ${escMd(position.tokenSymbol)}*`,
+      `CA: \`${position.tokenAddress}\``,
       `Pool: \`${position.poolAddress}\``,
       `SOL: ${position.solAmount}`,
       `Fee: ${(position.feeBps / 100).toFixed(2)}%`,
       `Entry price: $${position.entryPrice.toFixed(8)}`,
     ].join('\n');
-    await this.sendMessage(text);
+    // Кнопка «выйти сейчас» прямо на сообщении открытия — главный
+    // инструмент паники для оператора (решение заказчика).
+    await this.sendMessageWithButtons(text, [
+      [Markup.button.callback('🔴 Выйти сейчас', `close_position:${position.id}`)],
+    ]);
   }
 
   async notifyPositionClosed(position: Position, reason: ExitReason): Promise<void> {
@@ -167,14 +172,31 @@ export class TelegramBot {
       new_ath: '🚀 Новый ATH',
       fee_target: '💰 Цель по комиссиям достигнута',
       chart_degradation: '📉 Деградация графика',
+      panic_composite: '🚨 Panic-detector: совокупность негативных факторов',
       manual: '🖐 Ручное закрытие',
     };
     const text = [
       `🔴 *Позиция закрыта: ${escMd(position.tokenSymbol)}*`,
+      `CA: \`${position.tokenAddress}\``,
       `Причина: ${reasonText[reason]}`,
       `PnL: ${pnlSign}${(position.pnlSol ?? 0).toFixed(4)} SOL`,
     ].join('\n');
     await this.sendMessage(text);
+  }
+
+  /** Предупреждение о деградации графика — без авто-выхода, с кнопкой ручного выхода. */
+  async notifyDegradation(positionId: number, tokenSymbol: string, message: string): Promise<void> {
+    const text = [
+      `⚠️ *Предупреждение: ${escMd(tokenSymbol)}*`,
+      `${escMd(message)}`,
+      ``,
+      `Авто-выхода по одной деградации нет (решение заказчика).`,
+      `Хочешь закрыть позицию #${positionId} вручную?`,
+    ].join('\n');
+    await this.sendMessageWithButtons(text, [
+      [Markup.button.callback('🔴 Закрыть сейчас', `close_position:${positionId}`)],
+      [Markup.button.callback('🤝 Держать', `keep_position:${positionId}`)],
+    ]);
   }
 
   async notifyError(message: string): Promise<void> {
@@ -219,27 +241,19 @@ export class TelegramBot {
     });
 
     this.bot.command('status', async (ctx) => {
-      const db = getDb();
-      const activePositions = db
-        .prepare(`SELECT COUNT(*) as cnt FROM positions WHERE status='active'`)
-        .get() as { cnt: number };
-      const watching = db
-        .prepare(`SELECT COUNT(*) as cnt FROM watched_tokens WHERE status='watching'`)
-        .get() as { cnt: number };
+      const active = Positions.countActive();
+      const watching = WatchedTokens.countWatching();
 
       ctx.reply(
         `🤖 *Бот работает*\n` +
-          `📊 Активных позиций: ${activePositions.cnt}/${config.lp.maxPositions}\n` +
-          `👀 Отслеживается токенов: ${watching.cnt}`,
+          `📊 Активных позиций: ${active}/${config.lp.maxPositions}\n` +
+          `👀 Отслеживается токенов: ${watching}`,
         { parse_mode: 'Markdown' }
       );
     });
 
     this.bot.command('positions', async (ctx) => {
-      const db = getDb();
-      const positions = db
-        .prepare(`SELECT * FROM positions WHERE status='active' ORDER BY opened_at DESC`)
-        .all() as Position[];
+      const positions = Positions.findActive();
 
       if (positions.length === 0) {
         ctx.reply('Нет активных позиций');
@@ -320,9 +334,35 @@ export class TelegramBot {
 
     this.bot.action(/^close_position:(\d+)$/, async (ctx) => {
       const positionId = parseInt(ctx.match[1], 10);
+      // Идемпотентность: если позиции уже нет в статусе active — отвечаем
+      // тихо, без второй попытки закрытия. LpManager тоже защищён переходом
+      // active → closing, но лучше отрезать как можно раньше.
+      const pos = Positions.findById(positionId);
+      if (!pos || pos.status !== 'active') {
+        await ctx.answerCbQuery(
+          pos ? `Уже ${pos.status === 'closing' ? 'закрывается' : 'закрыта'}` : 'Нет такой позиции'
+        );
+        return;
+      }
       await ctx.answerCbQuery('Закрываем позицию...');
-      await ctx.editMessageText(`⏳ Закрываем позицию #${positionId}...`);
+      try {
+        await ctx.editMessageText(`⏳ Закрываем позицию #${positionId}...`);
+      } catch {
+        // Сообщение могло быть уже отредактировано (двойной клик) — игнорируем.
+      }
       this.onExitPosition?.(positionId);
+    });
+
+    // Кнопка «Держать» под предупреждением о деградации — ничего не делаем
+    // на бекенде, только перерисовываем сообщение, чтобы убрать кнопки.
+    this.bot.action(/^keep_position:(\d+)$/, async (ctx) => {
+      const positionId = parseInt(ctx.match[1], 10);
+      await ctx.answerCbQuery('Держим позицию');
+      try {
+        await ctx.editMessageText(`🤝 Держим позицию #${positionId} (предупреждение принято)`);
+      } catch {
+        /* ignore */
+      }
     });
 
     // Manual override for security-failed tokens
