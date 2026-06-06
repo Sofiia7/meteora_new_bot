@@ -10,7 +10,7 @@ import DLMM, { LbPosition, StrategyType } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
 import bs58 from 'bs58';
 import axios from 'axios';
-import { config } from '../../shared/config';
+import { config, isMainnetTradingEnabled } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { getDb } from '../../shared/db';
 import { PoolInfo, Position } from '../../shared/types';
@@ -28,6 +28,10 @@ export class LpManager {
     logger.info(`Wallet: ${this.wallet.publicKey.toBase58()}`);
   }
 
+  getWalletAddress(): string {
+    return this.wallet.publicKey.toBase58();
+  }
+
   getActivePositionCount(): number {
     const db = getDb();
     const row = db
@@ -40,6 +44,35 @@ export class LpManager {
     return this.getActivePositionCount() < config.lp.maxPositions;
   }
 
+  /**
+   * Проверка баланса перед открытием: LP_AMOUNT_SOL + rent + buffer (раздел 3.4 ТЗ).
+   * Возвращает null если ОК, иначе — описание проблемы для уведомления в TG.
+   */
+  async checkSufficientBalance(): Promise<string | null> {
+    try {
+      const lamports = await this.connection.getBalance(this.wallet.publicKey);
+      const balanceSol = lamports / LAMPORTS_PER_SOL;
+
+      const lpAmount = config.lp.amountSol;
+      const bufferAbs = config.lp.safetyBufferSol;
+      const bufferPct = (lpAmount * config.lp.safetyBufferPct) / 100;
+      // rent для bin arrays + position (грубая оценка, уточним по факту на devnet).
+      const rentEstimate = 0.07;
+      const required = lpAmount + rentEstimate + Math.max(bufferAbs, bufferPct);
+
+      if (balanceSol < required) {
+        return (
+          `Недостаточно SOL: баланс ${balanceSol.toFixed(4)}, нужно ≥ ${required.toFixed(4)} ` +
+          `(LP ${lpAmount} + rent ${rentEstimate} + buffer)`
+        );
+      }
+      return null;
+    } catch (err) {
+      logger.error(`Balance check failed: ${err}`);
+      return `Не удалось проверить баланс: ${err}`;
+    }
+  }
+
   async openPosition(
     tokenAddress: string,
     tokenSymbol: string,
@@ -47,6 +80,21 @@ export class LpManager {
   ): Promise<Position | null> {
     if (!this.canOpenPosition()) {
       logger.warn('Max positions reached, cannot open new position');
+      return null;
+    }
+
+    // Safety gate: реальные транзакции только при явном разрешении.
+    if (!isMainnetTradingEnabled()) {
+      logger.warn(
+        `[DRY_RUN] openPosition skipped for ${tokenSymbol}. ` +
+          `Set DRY_RUN=false и ENABLE_MAINNET_TRADING=true чтобы торговать.`
+      );
+      return null;
+    }
+
+    const balanceError = await this.checkSufficientBalance();
+    if (balanceError) {
+      logger.warn(`openPosition aborted: ${balanceError}`);
       return null;
     }
 
@@ -136,6 +184,14 @@ export class LpManager {
 
     if (!position) {
       logger.warn(`Position ${positionId} not found or already closed`);
+      return null;
+    }
+
+    if (!isMainnetTradingEnabled()) {
+      logger.warn(
+        `[DRY_RUN] closePosition skipped for position ${positionId}. ` +
+          `Реальное закрытие отключено safety-gate'ом.`
+      );
       return null;
     }
 

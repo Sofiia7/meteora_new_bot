@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import fs from 'fs';
 import { logger } from './shared/logger';
+import { config, isMainnetTradingEnabled } from './shared/config';
 import { getDb } from './shared/db';
 import { ScannerService } from './services/scanner';
 import { SecurityChecker } from './services/security';
@@ -14,6 +15,32 @@ import { TokenInfo, PoolInfo } from './shared/types';
 fs.mkdirSync('data', { recursive: true });
 fs.mkdirSync('logs', { recursive: true });
 
+function printStartupBanner(walletAddress: string): void {
+  const mode = isMainnetTradingEnabled() ? '🔴 MAINNET TRADING' : '🟡 DRY_RUN (no real tx)';
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const dlmmVersion = (() => {
+    try {
+      return require('@meteora-ag/dlmm/package.json').version as string;
+    } catch {
+      return 'unknown';
+    }
+  })();
+  const lines = [
+    '╔═══════════════════════════════════════════════════════════',
+    '║  Meteora LP Bot',
+    `║  Mode:           ${mode}`,
+    `║  Wallet:         ${walletAddress}`,
+    `║  Allowed chats:  ${config.telegram.allowedChatIds.join(', ')}`,
+    `║  Max positions:  ${config.lp.maxPositions}`,
+    `║  LP per pos:     ${config.lp.amountSol} SOL`,
+    `║  Panic factors:  ${config.panic.requiredFactors} of M in ${config.panic.timeWindowMin}m`,
+    `║  ATH re-notify:  +${config.athRenotify.pct}% (cooldown ${config.athRenotify.cooldownMin}m)`,
+    `║  @meteora-ag/dlmm: ${dlmmVersion}`,
+    '╚═══════════════════════════════════════════════════════════',
+  ];
+  for (const l of lines) logger.info(l);
+}
+
 async function main(): Promise<void> {
   logger.info('=== Meteora LP Bot starting ===');
 
@@ -25,6 +52,8 @@ async function main(): Promise<void> {
   const lpManager = new LpManager();
   const tgBot = new TelegramBot();
   const exitStrategy = new ExitStrategy(lpManager, scanner);
+
+  printStartupBanner(lpManager.getWalletAddress());
 
   // ─── Wire up Scanner → Security → PoolWatcher ─────────────────────────────
 
@@ -212,7 +241,11 @@ async function main(): Promise<void> {
   exitStrategy.start();
 
   logger.info('All services started');
-  await tgBot.sendMessage('🤖 *Meteora LP Bot запущен*');
+  const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY\\_RUN';
+  await tgBot.sendMessage(
+    `🤖 *Meteora LP Bot запущен* — ${modeLabel}\n` +
+      `Кошелёк: \`${lpManager.getWalletAddress()}\``
+  );
 
   // Graceful shutdown
   process.on('SIGTERM', shutdown);

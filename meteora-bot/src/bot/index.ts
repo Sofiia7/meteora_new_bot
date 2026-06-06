@@ -19,8 +19,43 @@ export class TelegramBot {
 
   constructor() {
     this.bot = new Telegraf(config.telegram.botToken);
+    this.setupAuthGuard();
     this.setupCommands();
     this.setupCallbackHandlers();
+  }
+
+  /**
+   * Middleware: блокирует любые входящие апдейты от чатов, которых нет в allowlist.
+   * Управляет ботом (тратит кошелёк) только тот, кто в TELEGRAM_ALLOWED_CHAT_IDS
+   * (по умолчанию — только TELEGRAM_CHAT_ID).
+   */
+  private setupAuthGuard(): void {
+    const allowed = new Set(config.telegram.allowedChatIds.map(String));
+    this.bot.use(async (ctx: Context, next) => {
+      const chatId = ctx.chat?.id !== undefined ? String(ctx.chat.id) : undefined;
+      const userId = ctx.from?.id !== undefined ? String(ctx.from.id) : undefined;
+
+      const ok =
+        (chatId !== undefined && allowed.has(chatId)) ||
+        (userId !== undefined && allowed.has(userId));
+
+      if (!ok) {
+        logger.warn(
+          `Blocked unauthorized TG update: chat_id=${chatId} user=${userId} ` +
+            `(@${ctx.from?.username ?? '?'})`
+        );
+        // Тихо отвечаем callback'у, чтобы не висел спиннер.
+        if ('callbackQuery' in ctx.update) {
+          try {
+            await ctx.answerCbQuery('⛔ Доступ запрещён');
+          } catch {
+            /* ignore */
+          }
+        }
+        return; // не пропускаем дальше
+      }
+      return next();
+    });
   }
 
   start(): void {
@@ -127,6 +162,7 @@ export class TelegramBot {
   async notifyPositionClosed(position: Position, reason: ExitReason): Promise<void> {
     const pnlSign = (position.pnlSol ?? 0) >= 0 ? '+' : '';
     const reasonText: Record<ExitReason, string> = {
+      stop_loss: '🛑 Стоп-лосс (страховка)',
       bollinger_breakout: '📈 Bollinger Bands breakout',
       new_ath: '🚀 Новый ATH',
       fee_target: '💰 Цель по комиссиям достигнута',

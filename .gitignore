@@ -1,13 +1,22 @@
 # Secrets & Credentials
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 *.json
 !package.json
+!package-lock.json
 !tsconfig.json
 !openclaw.json
 secrets.json
+
+# SQLite data
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Python
 __pycache__/
