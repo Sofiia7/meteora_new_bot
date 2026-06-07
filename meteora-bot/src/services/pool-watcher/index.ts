@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { meteoraQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { PoolInfo } from '../../shared/types';
@@ -85,21 +85,30 @@ export class PoolWatcher {
       const pools = await this.fetchPools(tokenAddress);
       if (pools.length === 0) return;
 
-      const targetPools = pools.filter((p) => p.feeBps === config.poolWatcher.targetFeeBps);
-      const hasTarget = targetPools.length > 0;
+      // ТЗ 2.2: идеальный пул = DLMM-Dynamic + fee 5% (500 bps) + binStep 80/100/125.
+      // Раньше код фильтровал только по fee и игнорировал binStep/тип.
+      const preferred = new Set(config.poolWatcher.preferredBinSteps);
+      const isIdealPool = (p: PoolInfo): boolean =>
+        p.feeBps === config.poolWatcher.targetFeeBps && preferred.has(p.binStep);
 
-      // If we found target pool → notify immediately and stop watching
-      if (hasTarget) {
-        logger.info(`Found ${config.poolWatcher.targetFeeBps / 100}% fee pool for ${entry.tokenSymbol}`);
+      const idealPools = pools.filter(isIdealPool);
+      if (idealPools.length > 0) {
+        logger.info(
+          `Found ideal pool for ${entry.tokenSymbol}: fee=${config.poolWatcher.targetFeeBps / 100}%, ` +
+            `binStep ∈ {${[...preferred].join(',')}}`
+        );
         this.stopWatching(tokenAddress);
-        for (const cb of this.onFoundCallbacks) cb(tokenAddress, targetPools, true);
+        for (const cb of this.onFoundCallbacks) cb(tokenAddress, idealPools, true);
         return;
       }
 
-      // No target pool, but alternatives exist — notify once
+      // Альтернативы существуют, но без нужных параметров — уведомляем один раз
+      // и продолжаем ждать идеальный пул до таймаута (2 часа).
       if (!entry.notifiedAlternatives && pools.length > 0) {
         entry.notifiedAlternatives = true;
-        logger.info(`No 5% pool for ${entry.tokenSymbol}, found ${pools.length} alternatives`);
+        logger.info(
+          `No ideal pool for ${entry.tokenSymbol}, found ${pools.length} alternative pools`
+        );
         for (const cb of this.onFoundCallbacks) cb(tokenAddress, pools, false);
       }
     } catch (err) {
@@ -109,14 +118,25 @@ export class PoolWatcher {
 
   async fetchPools(tokenAddress: string): Promise<PoolInfo[]> {
     try {
-      const resp = await axios.get(`${METEORA_API}/pair/all_with_pagination`, {
-        params: { token: tokenAddress, limit: 20, page: 0 },
-        timeout: 10000,
-      });
+      const resp = await meteoraQ.get<{ data?: MeteoraPair[]; pairs?: MeteoraPair[] }>(
+        `${METEORA_API}/pair/all_with_pagination`,
+        {
+          params: { token: tokenAddress, limit: 20, page: 0 },
+          timeout: 10000,
+        }
+      );
 
       const pairs: MeteoraPair[] = resp.data?.data ?? resp.data?.pairs ?? [];
       return pairs
-        .filter((p) => p.mint_x === tokenAddress || p.mint_y === tokenAddress)
+        .filter((p) => {
+          if (p.mint_x !== tokenAddress && p.mint_y !== tokenAddress) return false;
+          // ТЗ требует DLMM-Dynamic; всё остальное (AMM v1, DAMM) отбрасываем.
+          // Поле точно называется по-разному в зависимости от ответа API —
+          // принимаем оба варианта, как минимум исключаем AMM.
+          const tp = (p.pool_type ?? p.type ?? '').toString().toUpperCase();
+          if (tp && tp !== 'DLMM' && tp !== 'DYNAMIC') return false;
+          return true;
+        })
         .map((p) => ({
           address: p.address,
           tokenMint: tokenAddress,
@@ -143,4 +163,6 @@ interface MeteoraPair {
   liquidity?: string;
   active_bin_id?: number;
   current_price?: string;
+  pool_type?: string;
+  type?: string;
 }

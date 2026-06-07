@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { gmgnQ, rugcheckQ, bubblemapsQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { cacheGet, cacheSet } from '../../shared/redis';
@@ -69,7 +69,7 @@ export class SecurityChecker {
 
   private async checkGmgn(tokenAddress: string): Promise<{ totalFeesSol: number; hasTwitter: boolean }> {
     try {
-      const resp = await axios.get(`${GMGN_API}/${tokenAddress}`, { timeout: 8000 });
+      const resp = await gmgnQ.get(`${GMGN_API}/${tokenAddress}`, { timeout: 8000 });
       const data = resp.data?.data ?? {};
       return {
         totalFeesSol: parseFloat(data.total_fees_sol ?? data.fee_sol ?? '0') || 0,
@@ -83,7 +83,7 @@ export class SecurityChecker {
 
   private async checkRugcheck(tokenAddress: string): Promise<{ status: string }> {
     try {
-      const resp = await axios.get(`${RUGCHECK_API}/tokens/${tokenAddress}/report/summary`, { timeout: 8000 });
+      const resp = await rugcheckQ.get(`${RUGCHECK_API}/tokens/${tokenAddress}/report/summary`, { timeout: 8000 });
       return { status: resp.data?.score_normalised >= 80 ? 'Good' : (resp.data?.status ?? 'unknown') };
     } catch (err) {
       logger.warn(`RugCheck failed for ${tokenAddress}: ${err}`);
@@ -93,7 +93,7 @@ export class SecurityChecker {
 
   private async checkBubbleMaps(tokenAddress: string): Promise<{ topHoldersPercent: number }> {
     try {
-      const resp = await axios.get(`${BUBBLEMAPS_API}?token=${tokenAddress}&chain=sol`, { timeout: 8000 });
+      const resp = await bubblemapsQ.get(`${BUBBLEMAPS_API}?token=${tokenAddress}&chain=sol`, { timeout: 8000 });
       const holders: Array<{ percentage: number }> = resp.data?.nodes ?? [];
       // Top 10 holders concentration
       const top10 = holders

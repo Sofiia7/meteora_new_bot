@@ -12,6 +12,8 @@ import { PoolWatcher } from './services/pool-watcher';
 import { LpManager } from './services/lp-manager';
 import { ExitStrategy } from './services/exit-strategy';
 import { PanicDetector } from './services/panic-detector';
+import { ChartHealthAnalyzer } from './services/chart-health';
+import { AthWatcher } from './services/ath-watcher';
 import { TelegramBot } from './bot';
 import { TokenInfo, PoolInfo } from './shared/types';
 
@@ -57,24 +59,38 @@ async function main(): Promise<void> {
   const tgBot = new TelegramBot();
   const exitStrategy = new ExitStrategy(lpManager, scanner);
   const panicDetector = new PanicDetector(lpManager, scanner, exitStrategy);
+  const chartHealth = new ChartHealthAnalyzer();
+  const athWatcher = new AthWatcher(scanner);
 
   printStartupBanner(lpManager.getWalletAddress());
 
   // ─── Wire up Scanner → Security → PoolWatcher ─────────────────────────────
 
-  scanner.onToken(async (token: TokenInfo) => {
-    logger.info(`Processing token: ${token.symbol} (${token.address})`);
-
+  /**
+   * Главный пайплайн обработки токена. Используется и сканером (первое
+   * обнаружение), и AthWatcher'ом (re-notify по новому ATH +X%).
+   */
+  const processToken = async (token: TokenInfo, prefix = ''): Promise<void> => {
+    logger.info(`${prefix}Processing token: ${token.symbol} (${token.address})`);
     Tokens.upsert(token);
 
+    // 1. Chart-health (ТЗ 1.2).
+    const health = chartHealth.analyze(token);
+    if (!health.passes) {
+      logger.info(
+        `${token.symbol} health score ${health.score}/100 < min ${health.score}, skip. ` +
+          `Reasons: ${health.reasons.join('; ')}`
+      );
+      return;
+    }
+
+    // 2. Security re-check (полный — даже при re-notify, ловим отложенный руг).
     const secResult = await security.check(token.address);
     Tokens.setSecurity(token.address, secResult.passed, secResult.warnings);
 
     await tgBot.notifyNewToken(token, secResult);
 
     if (!secResult.passed) {
-      // Telegram-кнопка force_enter подключается в Фазе 5; пока — текстовое
-      // приглашение, пользователь может ответить /scan force:<CA>.
       await tgBot.sendMessage(
         `⚠️ Токен *${token.symbol}* не прошёл проверку безопасности\\.\n` +
           `Чтобы всё равно отслеживать пул — ответьте: \`/scan force:${token.address}\``
@@ -89,13 +105,48 @@ async function main(): Promise<void> {
 
     WatchedTokens.insertWatching(token.address, token.symbol);
     poolWatcher.watch(token.address, token.symbol);
+  };
+
+  scanner.onToken((token) => void processToken(token));
+
+  // Re-notification по новому ATH (+ATH_RENOTIFY_PCT% над прошлым уведомлением).
+  // Полный перепрогон пайплайна — chart-health + security заново.
+  athWatcher.onRenotify(async (token, newAth, prevAth) => {
+    await tgBot.sendMessage(
+      `🚀 *Новый ATH +${config.athRenotify.pct}%:* ${token.symbol}\n` +
+        `CA: \`${token.address}\`\n` +
+        `Цена: $${newAth.toFixed(8)} (прошлый ATH-уведом: $${prevAth.toFixed(8)})`
+    );
+    await processToken(token, '[ATH re-notify] ');
   });
 
   // ─── Pool found → notify TG for confirmation ──────────────────────────────
 
   poolWatcher.onPoolFound(async (tokenAddress, pools, hasTargetFee) => {
-    const token = await scanner.fetchTokenInfo(tokenAddress);
-    if (!token) return;
+    let token = await scanner.fetchTokenInfo(tokenAddress);
+    if (!token) {
+      // fetchTokenInfo может null'нуть из-за рейтлимита / кэша / 5xx —
+      // раньше при этом пул терялся молча. Сейчас минимальный «синтетический»
+      // токен, чтобы пользователь хотя бы получил уведомление с CA.
+      const symbol = WatchedTokens.latestSymbol(tokenAddress) ?? tokenAddress.slice(0, 8);
+      token = {
+        address: tokenAddress,
+        symbol,
+        name: symbol,
+        marketCap: 0,
+        volume24h: 0,
+        priceUsd: 0,
+        priceChange24h: 0,
+        ath: 0,
+        athDate: '',
+        liquidity: 0,
+        pairAddress: '',
+        dexId: '',
+        chainId: 'solana',
+        createdAt: 0,
+      };
+      logger.warn(`Pool found but token info unavailable — notifying with stub for ${tokenAddress}`);
+    }
 
     await tgBot.notifyPoolFound(token, pools, hasTargetFee);
   });
@@ -241,6 +292,7 @@ async function main(): Promise<void> {
   scanner.start();
   exitStrategy.start();
   panicDetector.start();
+  athWatcher.start();
 
   logger.info('All services started');
   const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY\\_RUN';
@@ -266,6 +318,7 @@ async function main(): Promise<void> {
     scanner.stop();
     exitStrategy.stop();
     panicDetector.stop();
+    athWatcher.stop();
     tgBot.stop();
     process.exit(0);
   }

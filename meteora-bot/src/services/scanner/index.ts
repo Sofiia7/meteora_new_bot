@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { dexscreenerQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { cacheGet, cacheSet } from '../../shared/redis';
@@ -67,12 +67,12 @@ export class ScannerService {
   }
 
   private passesFilters(token: TokenInfo): boolean {
+    // Базовые фильтры; полный chart-health (ATH, RSI, volume score) считается
+    // в ChartHealthAnalyzer и применяется в main.ts ПОСЛЕ scanner, чтобы один
+    // и тот же analyzer мог переиспользоваться при ATH-re-notify.
     if (token.marketCap < config.scanner.minMarketCap) return false;
     if (token.volume24h < config.scanner.minVolume24h) return false;
     if (token.chainId !== 'solana') return false;
-    // Basic chart health: token not already at extreme ATH distance
-    const athDistance = token.ath > 0 ? (token.priceUsd / token.ath) : 1;
-    if (athDistance < 0.01) return false; // Price collapsed >99% from ATH
     return true;
   }
 
@@ -84,7 +84,7 @@ export class ScannerService {
     }
 
     // DexScreener token profiles endpoint returns recent tokens
-    const resp = await axios.get(DEXSCREENER_API, { timeout: 10000 });
+    const resp = await dexscreenerQ.get(DEXSCREENER_API, { timeout: 10000 });
     const profiles: Array<{
       tokenAddress: string;
       chainId: string;
@@ -112,7 +112,7 @@ export class ScannerService {
 
   private async fetchPairDataBatch(addresses: string[]): Promise<TokenInfo[]> {
     const url = `https://api.dexscreener.com/tokens/v1/solana/${addresses.join(',')}`;
-    const resp = await axios.get(url, { timeout: 10000 });
+    const resp = await dexscreenerQ.get(url, { timeout: 10000 });
     const pairs: DexScreenerPair[] = resp.data ?? [];
     return pairs.map(pairToTokenInfo).filter((t): t is TokenInfo => t !== null);
   }
@@ -123,7 +123,7 @@ export class ScannerService {
     if (cached) return JSON.parse(cached) as TokenInfo;
 
     const url = `https://api.dexscreener.com/tokens/v1/solana/${address}`;
-    const resp = await axios.get(url, { timeout: 10000 });
+    const resp = await dexscreenerQ.get(url, { timeout: 10000 });
     const pairs: DexScreenerPair[] = resp.data ?? [];
     if (!pairs.length) return null;
 
