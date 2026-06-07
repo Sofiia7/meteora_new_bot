@@ -63,7 +63,28 @@ function initSchema(db: Database.Database): void {
       triggered_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
+    -- Persisted price history for exit-strategy / panic-detector.
+    -- Это даёт recovery после рестарта: BB/RSI/ATH не «забываются».
+    CREATE TABLE IF NOT EXISTS price_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      position_id INTEGER NOT NULL REFERENCES positions(id),
+      ts INTEGER NOT NULL DEFAULT (unixepoch()),
+      price REAL NOT NULL
+    );
+
+    -- ATH-трекер для re-notification по новому хаю (Фаза 3 будет писать сюда
+    -- last_notified_*; таблицу создаём сейчас, чтобы не трогать схему дважды).
+    CREATE TABLE IF NOT EXISTS token_ath (
+      address TEXT PRIMARY KEY,
+      ath REAL NOT NULL DEFAULT 0,
+      ath_at INTEGER,
+      last_notified_ath REAL NOT NULL DEFAULT 0,
+      last_notified_at INTEGER
+    );
+
     CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_watched_status ON watched_tokens(status);
+    CREATE INDEX IF NOT EXISTS idx_tokens_discovered ON tokens(discovered_at);
+    CREATE INDEX IF NOT EXISTS idx_price_history_pos_ts ON price_history(position_id, ts);
   `);
 }

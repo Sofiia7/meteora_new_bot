@@ -196,6 +196,111 @@ export const Tokens = {
       .prepare(`UPDATE tokens SET security_passed=?, security_warnings=? WHERE address=?`)
       .run(passed ? 1 : 0, JSON.stringify(warnings), address);
   },
+
+  /**
+   * Замена in-memory `seenTokens` Scanner'а: персистентно проверяем,
+   * видели ли мы этот адрес недавно. По умолчанию окно — 24 часа,
+   * чтобы новая «жизнь» токена через сутки могла проявиться повторно
+   * (полезно для re-notification по новому ATH в Фазе 3).
+   */
+  seenWithin(address: string, windowSec: number): boolean {
+    const row = getDb()
+      .prepare(
+        `SELECT 1 FROM tokens
+         WHERE address=? AND discovered_at >= unixepoch() - ?`
+      )
+      .get(address, windowSec) as { 1: number } | undefined;
+    return !!row;
+  },
+};
+
+export const PriceHistoryRepo = {
+  insert(positionId: number, price: number): void {
+    getDb()
+      .prepare(`INSERT INTO price_history (position_id, price) VALUES (?, ?)`)
+      .run(positionId, price);
+  },
+
+  /** Возвращает последние N цен в хронологическом порядке (старые → новые). */
+  latestN(positionId: number, n: number): number[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT price FROM (
+           SELECT id, price FROM price_history
+           WHERE position_id=? ORDER BY id DESC LIMIT ?
+         ) ORDER BY id ASC`
+      )
+      .all(positionId, n) as { price: number }[];
+    return rows.map((r) => r.price);
+  },
+
+  /** Чистим, чтобы price_history не разрасталась бесконечно. */
+  pruneOlder(positionId: number, keepLast: number): void {
+    getDb()
+      .prepare(
+        `DELETE FROM price_history
+         WHERE position_id=? AND id NOT IN (
+           SELECT id FROM price_history WHERE position_id=? ORDER BY id DESC LIMIT ?
+         )`
+      )
+      .run(positionId, positionId, keepLast);
+  },
+
+  deleteByPosition(positionId: number): void {
+    getDb()
+      .prepare(`DELETE FROM price_history WHERE position_id=?`)
+      .run(positionId);
+  },
+};
+
+export interface TokenAthRow {
+  address: string;
+  ath: number;
+  athAt: number | null;
+  lastNotifiedAth: number;
+  lastNotifiedAt: number | null;
+}
+
+export const TokenAthRepo = {
+  get(address: string): TokenAthRow | null {
+    const row = getDb()
+      .prepare(
+        `SELECT address,
+                ath,
+                ath_at            AS athAt,
+                last_notified_ath AS lastNotifiedAth,
+                last_notified_at  AS lastNotifiedAt
+         FROM token_ath WHERE address=?`
+      )
+      .get(address) as TokenAthRow | undefined;
+    return row ?? null;
+  },
+
+  /** Обновляем ATH если новый выше. Возвращает true, если ATH вырос. */
+  updateIfHigher(address: string, price: number): boolean {
+    if (price <= 0) return false;
+    const res = getDb()
+      .prepare(
+        `INSERT INTO token_ath (address, ath, ath_at) VALUES (?, ?, unixepoch())
+         ON CONFLICT(address) DO UPDATE SET
+           ath = excluded.ath, ath_at = excluded.ath_at
+         WHERE excluded.ath > token_ath.ath`
+      )
+      .run(address, price);
+    return res.changes > 0;
+  },
+
+  markNotified(address: string, price: number): void {
+    getDb()
+      .prepare(
+        `INSERT INTO token_ath (address, ath, ath_at, last_notified_ath, last_notified_at)
+         VALUES (?, ?, unixepoch(), ?, unixepoch())
+         ON CONFLICT(address) DO UPDATE SET
+           last_notified_ath = excluded.last_notified_ath,
+           last_notified_at  = excluded.last_notified_at`
+      )
+      .run(address, price, price);
+  },
 };
 
 export function recordSignal(positionId: number, reason: string, details: string): void {

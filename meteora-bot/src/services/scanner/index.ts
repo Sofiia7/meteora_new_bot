@@ -2,7 +2,11 @@ import axios from 'axios';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { cacheGet, cacheSet } from '../../shared/redis';
+import { Tokens } from '../../shared/repositories';
 import { TokenInfo } from '../../shared/types';
+
+/** Окно дедупликации: повторно не уведомляем чаще, чем раз в N секунд. */
+const SEEN_WINDOW_SEC = 24 * 60 * 60; // 24 часа
 
 const DEXSCREENER_API = 'https://api.dexscreener.com/token-profiles/latest/v1';
 const DEXSCREENER_SEARCH = 'https://api.dexscreener.com/latest/dex/search';
@@ -11,7 +15,6 @@ export type ScannerCallback = (token: TokenInfo) => void;
 
 export class ScannerService {
   private intervalHandle: NodeJS.Timeout | null = null;
-  private seenTokens = new Set<string>();
   private callbacks: ScannerCallback[] = [];
 
   onToken(cb: ScannerCallback): void {
@@ -46,9 +49,15 @@ export class ScannerService {
     try {
       const tokens = await this.fetchLatestSolanaTokens();
       for (const token of tokens) {
-        if (this.seenTokens.has(token.address)) continue;
+        // Персистентная дедупликация: переживает рестарты (раньше Set in-memory
+        // → после рестарта шквал повторных уведомлений). 24-часовое окно
+        // оставляет место для re-notification по новому ATH в Фазе 3.
+        if (Tokens.seenWithin(token.address, SEEN_WINDOW_SEC)) continue;
         if (!this.passesFilters(token)) continue;
-        this.seenTokens.add(token.address);
+        // Upsert делает main.ts при onToken, но мы пишем сюда «след» сразу,
+        // чтобы между нашим логом и записью main.ts не пролез повторный
+        // тик scanner.
+        Tokens.upsert(token);
         logger.info(`Found token: ${token.symbol} (${token.address}) mcap=$${token.marketCap} vol=$${token.volume24h}`);
         for (const cb of this.callbacks) cb(token);
       }

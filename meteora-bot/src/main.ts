@@ -215,6 +215,28 @@ async function main(): Promise<void> {
 
   // ─── Start all services ───────────────────────────────────────────────────
 
+  // ─── Recovery после рестарта ──────────────────────────────────────────────
+  //
+  // Активные позиции подхватятся автоматически в первом же тике exit-strategy
+  // и panic-detector (они читают Positions.findActive()). priceHistory тоже
+  // lazy-восстанавливается из БД при первом обращении (Phase 2).
+  //
+  // Здесь нужно вручную «оживить» watched_tokens(watching) — иначе пользователь
+  // потеряет токены, которые бот ждал на момент падения.
+  const watchingRows = WatchedTokens.findWatching();
+  if (watchingRows.length > 0) {
+    logger.info(`Recovery: restoring ${watchingRows.length} watched tokens`);
+    for (const w of watchingRows) {
+      poolWatcher.watch(w.tokenAddress, w.tokenSymbol);
+    }
+  }
+  const activePositions = Positions.findActive();
+  if (activePositions.length > 0) {
+    logger.info(
+      `Recovery: ${activePositions.length} active positions will be picked up by monitors`
+    );
+  }
+
   tgBot.start();
   scanner.start();
   exitStrategy.start();
@@ -222,9 +244,17 @@ async function main(): Promise<void> {
 
   logger.info('All services started');
   const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY\\_RUN';
+  const recoveryLines: string[] = [];
+  if (watchingRows.length > 0) {
+    recoveryLines.push(`♻️ Восстановлено наблюдений: ${watchingRows.length}`);
+  }
+  if (activePositions.length > 0) {
+    recoveryLines.push(`♻️ Активных позиций: ${activePositions.length}`);
+  }
   await tgBot.sendMessage(
     `🤖 *Meteora LP Bot запущен* — ${modeLabel}\n` +
-      `Кошелёк: \`${lpManager.getWalletAddress()}\``
+      `Кошелёк: \`${lpManager.getWalletAddress()}\`` +
+      (recoveryLines.length ? `\n${recoveryLines.join('\n')}` : '')
   );
 
   // Graceful shutdown

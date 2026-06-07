@@ -1,7 +1,7 @@
 import { BollingerBands, RSI } from 'technicalindicators';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
-import { Positions, recordSignal } from '../../shared/repositories';
+import { Positions, PriceHistoryRepo, recordSignal } from '../../shared/repositories';
 import { Position, ExitSignal } from '../../shared/types';
 import { LpManager } from '../lp-manager';
 import { ScannerService } from '../scanner';
@@ -22,7 +22,11 @@ interface PriceHistory {
   ath: number;
   /** ATH, при котором мы в последний раз сигналили выход "new_ath". */
   lastSignalledAth: number;
+  /** Был ли уже подтянут из БД lazy-load'ом. */
+  loaded: boolean;
 }
+
+const MAX_HISTORY = 50;
 
 /**
  * Exit monitor — отвечает за тейк-профиты:
@@ -130,7 +134,14 @@ export class ExitStrategy {
 
     const history = this.getHistory(position.id);
     history.prices.push(currentPrice);
-    if (history.prices.length > 50) history.prices.shift();
+    if (history.prices.length > MAX_HISTORY) history.prices.shift();
+
+    // Персистим точку в БД (recovery после рестарта).
+    PriceHistoryRepo.insert(position.id, currentPrice);
+    // Раз в N тиков чистим старые записи, чтобы таблица не пухла.
+    if (history.prices.length % 25 === 0) {
+      PriceHistoryRepo.pruneOlder(position.id, MAX_HISTORY);
+    }
 
     // 2. New ATH — авто-выход (тейк-профит).
     //    Раньше код бампил history.ath ДО сравнения → условие никогда не срабатывало.
@@ -206,13 +217,24 @@ export class ExitStrategy {
   private getHistory(positionId: number): PriceHistory {
     let h = this.priceHistory.get(positionId);
     if (!h) {
-      h = { prices: [], ath: 0, lastSignalledAth: 0 };
+      // Lazy-load: при первом обращении (особенно после рестарта бота)
+      // подтягиваем последние N цен из БД, чтобы BB/RSI/ATH не начинали
+      // считать «с нуля» и слепо ждать period+1 минут до восстановления.
+      const persisted = PriceHistoryRepo.latestN(positionId, MAX_HISTORY);
+      const ath = persisted.reduce((m, p) => (p > m ? p : m), 0);
+      h = { prices: persisted, ath, lastSignalledAth: ath, loaded: true };
       this.priceHistory.set(positionId, h);
+      if (persisted.length > 0) {
+        logger.info(
+          `Position ${positionId}: restored ${persisted.length} price points from DB, ATH=${ath}`
+        );
+      }
     }
     return h;
   }
 
   clearHistory(positionId: number): void {
     this.priceHistory.delete(positionId);
+    PriceHistoryRepo.deleteByPosition(positionId);
   }
 }
