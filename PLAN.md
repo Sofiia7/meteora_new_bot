@@ -59,7 +59,12 @@
 
 ## Фазы
 
-> **Mainnet заблокирован, пока не закрыты Фазы 0–2.**
+> **Про мейннет:** технического блока нет — бот уже работал на мейннете с реальными
+> деньгами. «Безопасный» режим — это просто флаги `DRY_RUN=true` + `ENABLE_MAINNET_TRADING=false`
+> (safety-gate Фазы 0). Боевой режим включается флипом обоих флагов. **Devnet неприменим:**
+> мемкоин-пулов Meteora на devnet нет, тестировать там нечего; реальная проверка — мейннет
+> на минимальной сумме. Рекомендация: до боевого режима закрыть Фазы 0–2 (корректность денег)
+> и сверить парсинг security-API (Фаза 4) с живыми ответами.
 
 ### Фаза 0 — Safety gate ⚙️ (1–2 дня)
 - [ ] `DRY_RUN=true` по умолчанию; реальные транзакции только при `ENABLE_MAINNET_TRADING=true`.
@@ -70,7 +75,7 @@
 - [ ] `.gitignore`: добавить `!package-lock.json`, `!meteora-bot/package-lock.json`, `!meteora-bot/.env.example`.
 - [ ] Баннер при старте с режимом (DRY_RUN / MAINNET), адресом кошелька, версией DLMM.
 
-### Фаза 1 — Корректность денег и выходы 💰 (3–5 дней, на devnet)
+### Фаза 1 — Корректность денег и выходы 💰 (3–5 дней; тест — мейннет на минималке)
 - [ ] **Repository-слой** с маппером snake↔camel: `findActivePositions`, `findPositionById`, `updatePositionStatus` и т.п. Убрать все `SELECT *` из бизнес-кода.
 - [ ] Фикс `closePosition`: `poolAddress`/`positionPubkey`/`tokenAddress` берутся через маппер.
 - [ ] Определение стороны SOL: `dlmmPool.tokenX.publicKey.equals(WSOL)` → строим `totalXAmount`/`totalYAmount` соответствующе; для **single-sided SOL** диапазон строго ниже активного бина.
@@ -104,25 +109,57 @@
 - [ ] Обработка `fetchTokenInfo === null` в `notifyPoolFound` (сейчас пул теряется молча).
 
 ### Фаза 4 — Security engine 🔐 (3–4 дня)
-- [ ] Верифицировать **реальные** ответы GMGN/RugCheck/BubbleMaps (запустить, посмотреть JSON, обновить парсинг).
-- [ ] RugCheck: явно проверять `honeypot/mint authority/freeze authority`, инверсия score нормализована.
-- [ ] BubbleMaps: при ошибке — **fail-closed** (сейчас `0%` = «отлично»).
-- [ ] Score-based решение вместо `warnings.length === 0`; Twitter — мягкий минус.
-- [ ] **Security re-check периодически** для активных позиций → факторы F4/F5 в panic-detector.
+- [ ] ⚠️ **ОТКРЫТО (блокер качества):** верифицировать **реальные** ответы GMGN/RugCheck/BubbleMaps — нужен live-прогон с API-ключами на реальном токене, посмотреть JSON, подтвердить/поправить имена полей. Парсинг сейчас **защитный, но не верифицирован** (имена полей — предположения; неизвестное поле ⇒ false/недоступно, не ложный «ок»).
+- [x] RugCheck: явные проверки `honeypot / mint authority / freeze authority` (скан `risks[]` по имени + `level==='danger'`); `score_normalised` нормализован.
+- [x] BubbleMaps: при ошибке/пустых данных — **fail-closed** (было `0%`=«отлично» → стало «недоступно ⇒ 100%/штраф»).
+- [x] **Score-based решение** (0–100) вместо `warnings.length===0`: `passed = !hardFail && score>=MIN_SECURITY_SCORE`. Hard-fail (honeypot/authority/danger) перебивает скор. Twitter — мягкий минус (−10). Недоступность RugCheck/BubbleMaps — −40 (fail-closed).
+- [x] **Security re-check периодически** для активных позиций → **F4 `security_degraded`** (свежий hard-fail = отложенный руг) и **F5 `tvl_drop`** (падение TVL пула от пика) в panic-detector. Троттлинг `SECURITY_RECHECK_MIN` (деф. 5м) — бережём API-лимиты.
+- Новое: `SecurityResult` расширен (`score/hardFail/mint/freeze/honeypot/sourcesUnavailable`); скор и флаги показываются в TG-уведомлении о токене.
+- Проверка: `tsc --noEmit` — 0 ошибок.
+
+> Параметры Фазы 4 в `.env`: `MIN_SECURITY_SCORE=60`, `MAX_HOLDER_CONCENTRATION_PCT=50`, `SECURITY_RECHECK_MIN=5`. F5 использует уже существующий `PANIC_TVL_DROP_PCT`.
+
+### Фаза 4.1 — AI-аналитик (локальная LLM) 🤖
+- [x] Сервис `ai-analyst`: прогон метрик токена + security через **локальную** LLM
+  (OpenAI-совместимый эндпоинт — Ollama/LM Studio/vLLM), вердикт словами + риск 🟢/🟡/🔴
+  прямо в Telegram-алерт. Не блокирует решение — «второе мнение» для human-in-the-loop.
+- [x] По умолчанию `AI_ENABLED=false` (бот работает без LLM); никаких облачных вызовов.
+- [x] Толерантный парсер ответа (вытаскивает JSON из текста, fallback на сырой текст).
+- Параметры: `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`, `AI_TEMPERATURE`, `AI_MAX_TOKENS`, `AI_TIMEOUT_MS`.
 
 ### Фаза 5 — Telegram по ТЗ 💬 (1–2 дня)
-- [ ] **CA во всех `editMessageText`** (включая skip_pool, enter_pool, continue_watch, close_position, force_enter).
+- [x] **CA во всех сообщениях/`editMessageText`** (enter_pool, wait_pool, skip_pool, continue_watch, close_position, force_enter, wl_remove).
 - [ ] Подключить кнопку `force_enter` к UI (сейчас handler есть, кнопка не отправляется).
 - [ ] `/stop` — останавливает сканер (как требует ТЗ).
 - [ ] Полный формат уведомления о выходе: вошли/вышли/fees/время в позиции/% PnL.
-- [ ] Единый MarkdownV2 везде (сейчас `parse_mode:'Markdown'` + escape для V2 — несоответствие).
+- [x] ~~Единый MarkdownV2~~ → **перешли на единый `parse_mode:'HTML'`** (надёжнее для ссылок и экранирования; `escMd`→`escHtml`/`escAttr`). Убраны битые ручные `\_`/`\.`-экраны из V1.
 
-### Фаза 6 — Тесты + devnet + CI 🧪 (2–3 дня)
-- [ ] Unit-тесты: фильтры сканера, BB/RSI, mapper snake↔camel, PnL-калькулятор, panic-detector.
+### Фаза 5.1 — Ссылки + ручной выбор пула + ватчлист 🔗 (решения заказчика 2026-06-23)
+
+**Решения заказчика:**
+1. **Ссылки на ресурсы — везде, инлайн в тексте** (не кнопками): GMGN, BubbleMaps, RugCheck, DexScreener, Solscan, Photon на каждый токен; Meteora-ссылка на каждый пул/позицию.
+2. **Пулы: показывать ВСЕ DLMM-пулы по токену (все fee-%), не фильтровать по стратегии.** На каждый пул — кнопка входа, плюс «⏳ Ждать ещё» / «❌ Не входить». ⭐ помечает пул, совпадающий со стратегией (5% + binStep 80/100/125) — только пометка, выбирает человек. «Ничего сам не выдумывай, пользователь полностью контролирует процесс.»
+3. **Нет пулов вообще → мониторинг:** 2ч активный watch + по таймауту кнопка «продолжить наблюдение» (как было) + полноценный **ватчлист** с ручным добавлением/удалением.
+4. **Выходы НЕ трогаем** — вся матрица выходов остаётся как есть (ручная 🔴, тейк-профиты, composite panic, деградация-предупреждение).
+
+**Реализовано:**
+- [x] `shared/links.ts` — сборка ссылок из шаблонов `config.links` (override через `.env`); `tokenLinks()`, `meteoraPoolUrl()`. Битые URL (нет pairAddress) отбрасываются.
+- [x] `config.links.*` (7 шаблонов) + `POOL_BUTTONS_MAX` (кап кнопок пулов, деф. 8).
+- [x] Ссылки во всех уведомлениях: новый токен, пулы, позиция открыта/закрыта, деградация, ATH re-notify, `/positions`, `/watchlist`, таймаут.
+- [x] Pool-watcher: показываем все DLMM-пулы; дедуп по `notifiedPoolAddrs` (повторно уведомляем только о новых пулах); watch не останавливаем — решает пользователь. `onPoolFound(token, pools)` (убран `hasTargetFee`).
+- [x] `notifyPoolFound`: список всех пулов с ⭐, Meteora-ссылка на каждый, кнопка входа по индексу (`enter_pool:<ca>:<idx>` — укладываемся в лимит 64Б callback_data), «Ждать ещё»/«Не входить».
+- [x] Ватчлист: `/watchlist` (список + 🗑 убрать), `/watch <CA>` (добавить), репозиторий `WatchedTokens.listActiveWatchlist()` + `cancel()`; `onCancelWatch`/`onAddWatch` в main.ts.
+- [x] `DegradationWarning.tokenAddress` — проброс для ссылок в предупреждении.
+- Проверка: `tsc --noEmit` — 0 ошибок.
+
+### Фаза 6 — Тесты + CI 🧪 (2–3 дня)
+- [x] Тест-раннер (vitest) + `npm test`; юнит-тесты на чистую логику: **security-скоринг**
+  (hard-fail/fail-closed/soft-twitter) и **сборку ссылок**. 12 тестов зелёные.
+- [x] ESLint 9 flat config (`eslint.config.js`) — `npm run lint` зелёный, 0 предупреждений.
+- [ ] Расширить тесты: фильтры сканера, BB/RSI, mapper snake↔camel, PnL, окно panic-факторов.
 - [ ] Integration: Telegram callback'и через `bot.handleUpdate`, БД, mocked Meteora/Jupiter.
-- [ ] Прогон на **devnet** (полный цикл открытия/закрытия).
-- [ ] Ограниченный mainnet smoke на минимальной сумме.
-- [ ] GitHub Actions: `tsc --noEmit`, `eslint`, `jest`.
+- [ ] Ограниченный mainnet smoke на минимальной сумме (devnet неприменим — нет мем-пулов).
+- [ ] GitHub Actions: `tsc --noEmit`, `eslint`, `vitest`.
 
 ---
 
