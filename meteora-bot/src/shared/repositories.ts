@@ -170,6 +170,33 @@ export const WatchedTokens = {
       .prepare(`UPDATE watched_tokens SET status=? WHERE token_address=? AND status=?`)
       .run(toStatus, tokenAddress, fromStatus);
   },
+
+  /**
+   * Активный ватчлист для /watchlist: по одной (последней) записи на токен,
+   * только в незавершённых статусах. insertWatching() может создавать несколько
+   * строк на токен — берём строку с максимальным id.
+   */
+  listActiveWatchlist(): WatchedToken[] {
+    return getDb()
+      .prepare(
+        `SELECT ${WATCHED_COLUMNS} FROM watched_tokens w
+         WHERE w.id = (SELECT MAX(w2.id) FROM watched_tokens w2
+                       WHERE w2.token_address = w.token_address)
+           AND w.status IN ('watching','found_pool','timed_out')
+         ORDER BY w.started_at DESC`
+      )
+      .all() as WatchedToken[];
+  },
+
+  /** Ручное удаление из ватчлиста — переводим все незавершённые строки в cancelled. */
+  cancel(tokenAddress: string): void {
+    getDb()
+      .prepare(
+        `UPDATE watched_tokens SET status='cancelled'
+         WHERE token_address=? AND status IN ('watching','found_pool','timed_out')`
+      )
+      .run(tokenAddress);
+  },
 };
 
 export const Tokens = {

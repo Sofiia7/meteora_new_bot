@@ -17,11 +17,26 @@ export interface TokenInfo {
 
 export interface SecurityResult {
   passed: boolean;
+  /** Композитный скор безопасности 0–100 (Фаза 4). passed = !hardFail && score>=min. */
+  score: number;
+  /** Жёсткий провал: honeypot / активные authority / RugCheck danger. Перебивает score. */
+  hardFail: boolean;
   gmgnFeesSol: number;
   rugcheckStatus: string;
   holderConcentration: number;
   twitterActive: boolean;
+  mintAuthorityActive: boolean;
+  freezeAuthorityActive: boolean;
+  honeypot: boolean;
+  /** Источники, что не ответили — fail-closed: недоступность критичного источника штрафует скор. */
+  sourcesUnavailable: string[];
   warnings: string[];
+}
+
+/** Вердикт локальной LLM по токену (Фаза 4.1, опционально, AI_ENABLED). */
+export interface AiVerdict {
+  risk: 'low' | 'medium' | 'high' | 'unknown';
+  verdict: string;
 }
 
 export interface PoolInfo {

@@ -14,6 +14,7 @@ import { ExitStrategy } from './services/exit-strategy';
 import { PanicDetector } from './services/panic-detector';
 import { ChartHealthAnalyzer } from './services/chart-health';
 import { AthWatcher } from './services/ath-watcher';
+import { AiAnalyst } from './services/ai-analyst';
 import { TelegramBot } from './bot';
 import { TokenInfo, PoolInfo } from './shared/types';
 
@@ -21,9 +22,13 @@ import { TokenInfo, PoolInfo } from './shared/types';
 fs.mkdirSync('data', { recursive: true });
 fs.mkdirSync('logs', { recursive: true });
 
+/** Экранирование для немногих HTML-сообщений, что main.ts шлёт напрямую. */
+function escHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function printStartupBanner(walletAddress: string): void {
   const mode = isMainnetTradingEnabled() ? '🔴 MAINNET TRADING' : '🟡 DRY_RUN (no real tx)';
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const dlmmVersion = (() => {
     try {
       return require('@meteora-ag/dlmm/package.json').version as string;
@@ -50,17 +55,19 @@ function printStartupBanner(walletAddress: string): void {
 async function main(): Promise<void> {
   logger.info('=== Meteora LP Bot starting ===');
 
-  // Initialize services
-  const db = getDb();
+  // Initialize services. getDb() вызываем ради побочного эффекта — инициализации
+  // схемы БД; сами SQL-запросы идут через репозитории.
+  getDb();
   const scanner = new ScannerService();
   const security = new SecurityChecker();
   const poolWatcher = new PoolWatcher();
   const lpManager = new LpManager();
   const tgBot = new TelegramBot();
   const exitStrategy = new ExitStrategy(lpManager, scanner);
-  const panicDetector = new PanicDetector(lpManager, scanner, exitStrategy);
+  const panicDetector = new PanicDetector(scanner, exitStrategy, security);
   const chartHealth = new ChartHealthAnalyzer();
   const athWatcher = new AthWatcher(scanner);
+  const aiAnalyst = new AiAnalyst();
 
   printStartupBanner(lpManager.getWalletAddress());
 
@@ -88,12 +95,13 @@ async function main(): Promise<void> {
     const secResult = await security.check(token.address);
     Tokens.setSecurity(token.address, secResult.passed, secResult.warnings);
 
-    await tgBot.notifyNewToken(token, secResult);
+    const aiVerdict = await aiAnalyst.analyzeToken(token, secResult);
+    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
 
     if (!secResult.passed) {
       await tgBot.sendMessage(
-        `⚠️ Токен *${token.symbol}* не прошёл проверку безопасности\\.\n` +
-          `Чтобы всё равно отслеживать пул — ответьте: \`/scan force:${token.address}\``
+        `⚠️ Токен <b>${escHtml(token.symbol)}</b> не прошёл проверку безопасности.\n` +
+          `Чтобы всё равно отслеживать пул — ответьте: <code>/scan force:${escHtml(token.address)}</code>`
       );
       return;
     }
@@ -112,17 +120,13 @@ async function main(): Promise<void> {
   // Re-notification по новому ATH (+ATH_RENOTIFY_PCT% над прошлым уведомлением).
   // Полный перепрогон пайплайна — chart-health + security заново.
   athWatcher.onRenotify(async (token, newAth, prevAth) => {
-    await tgBot.sendMessage(
-      `🚀 *Новый ATH +${config.athRenotify.pct}%:* ${token.symbol}\n` +
-        `CA: \`${token.address}\`\n` +
-        `Цена: $${newAth.toFixed(8)} (прошлый ATH-уведом: $${prevAth.toFixed(8)})`
-    );
+    await tgBot.notifyAthRenotify(token, newAth, prevAth);
     await processToken(token, '[ATH re-notify] ');
   });
 
   // ─── Pool found → notify TG for confirmation ──────────────────────────────
 
-  poolWatcher.onPoolFound(async (tokenAddress, pools, hasTargetFee) => {
+  poolWatcher.onPoolFound(async (tokenAddress, pools) => {
     let token = await scanner.fetchTokenInfo(tokenAddress);
     if (!token) {
       // fetchTokenInfo может null'нуть из-за рейтлимита / кэша / 5xx —
@@ -148,13 +152,32 @@ async function main(): Promise<void> {
       logger.warn(`Pool found but token info unavailable — notifying with stub for ${tokenAddress}`);
     }
 
-    await tgBot.notifyPoolFound(token, pools, hasTargetFee);
+    await tgBot.notifyPoolFound(token, pools);
   });
 
   poolWatcher.onTimeout(async (tokenAddress, tokenSymbol) => {
     WatchedTokens.setStatus(tokenAddress, 'watching', 'timed_out');
     await tgBot.notifyPoolTimeout(tokenAddress, tokenSymbol);
   });
+
+  // ─── Ватчлист: «не входить» / убрать вручную / добавить вручную ───────────
+  //
+  // stopWatching живёт на poolWatcher (этот скоуп), поэтому отмену делаем здесь,
+  // а не в боте. cancel() переводит все незавершённые строки токена в cancelled.
+  tgBot.onCancelWatch = (tokenAddress: string) => {
+    poolWatcher.stopWatching(tokenAddress);
+    WatchedTokens.cancel(tokenAddress);
+  };
+
+  tgBot.onAddWatch = async (ca: string) => {
+    const token = await scanner.scanToken(ca);
+    if (!token) {
+      await tgBot.notifyError(`Токен ${ca} не найден`);
+      return;
+    }
+    WatchedTokens.insertWatching(token.address, token.symbol);
+    poolWatcher.watch(token.address, token.symbol);
+  };
 
   // ─── User confirms pool entry ──────────────────────────────────────────────
 
@@ -197,7 +220,8 @@ async function main(): Promise<void> {
     }
 
     const secResult = await security.check(token.address);
-    await tgBot.notifyNewToken(token, secResult);
+    const aiVerdict = await aiAnalyst.analyzeToken(token, secResult);
+    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
 
     if (!secResult.passed) {
       // Notify with force-enter button
@@ -261,7 +285,7 @@ async function main(): Promise<void> {
 
   // Деградация графика — НЕ авто-выход, а предупреждение с кнопкой.
   exitStrategy.onDegradationWarning(async (w) => {
-    await tgBot.notifyDegradation(w.positionId, w.tokenSymbol, w.message);
+    await tgBot.notifyDegradation(w.positionId, w.tokenSymbol, w.message, w.tokenAddress);
   });
 
   // ─── Start all services ───────────────────────────────────────────────────
@@ -295,7 +319,7 @@ async function main(): Promise<void> {
   athWatcher.start();
 
   logger.info('All services started');
-  const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY\\_RUN';
+  const modeLabel = isMainnetTradingEnabled() ? '🔴 MAINNET' : '🟡 DRY_RUN';
   const recoveryLines: string[] = [];
   if (watchingRows.length > 0) {
     recoveryLines.push(`♻️ Восстановлено наблюдений: ${watchingRows.length}`);
@@ -304,8 +328,8 @@ async function main(): Promise<void> {
     recoveryLines.push(`♻️ Активных позиций: ${activePositions.length}`);
   }
   await tgBot.sendMessage(
-    `🤖 *Meteora LP Bot запущен* — ${modeLabel}\n` +
-      `Кошелёк: \`${lpManager.getWalletAddress()}\`` +
+    `🤖 <b>Meteora LP Bot запущен</b> — ${modeLabel}\n` +
+      `Кошелёк: <code>${escHtml(lpManager.getWalletAddress())}</code>` +
       (recoveryLines.length ? `\n${recoveryLines.join('\n')}` : '')
   );
 

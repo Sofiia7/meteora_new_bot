@@ -9,7 +9,6 @@ import { TokenInfo } from '../../shared/types';
 const SEEN_WINDOW_SEC = 24 * 60 * 60; // 24 часа
 
 const DEXSCREENER_API = 'https://api.dexscreener.com/token-profiles/latest/v1';
-const DEXSCREENER_SEARCH = 'https://api.dexscreener.com/latest/dex/search';
 
 export type ScannerCallback = (token: TokenInfo) => void;
 
@@ -67,13 +66,7 @@ export class ScannerService {
   }
 
   private passesFilters(token: TokenInfo): boolean {
-    // Базовые фильтры; полный chart-health (ATH, RSI, volume score) считается
-    // в ChartHealthAnalyzer и применяется в main.ts ПОСЛЕ scanner, чтобы один
-    // и тот же analyzer мог переиспользоваться при ATH-re-notify.
-    if (token.marketCap < config.scanner.minMarketCap) return false;
-    if (token.volume24h < config.scanner.minVolume24h) return false;
-    if (token.chainId !== 'solana') return false;
-    return true;
+    return passesScannerFilters(token);
   }
 
   private async fetchLatestSolanaTokens(): Promise<TokenInfo[]> {
@@ -135,6 +128,18 @@ export class ScannerService {
     }
     return token;
   }
+}
+
+/**
+ * Базовые фильтры сканера (чистая функция — вынесена ради тестов). Полный
+ * chart-health (ATH/RSI/volume score) считается отдельно в ChartHealthAnalyzer
+ * ПОСЛЕ сканера, чтобы тот же analyzer переиспользовался при ATH-re-notify.
+ */
+export function passesScannerFilters(token: TokenInfo): boolean {
+  if (token.marketCap < config.scanner.minMarketCap) return false;
+  if (token.volume24h < config.scanner.minVolume24h) return false;
+  if (token.chainId !== 'solana') return false;
+  return true;
 }
 
 interface DexScreenerPair {

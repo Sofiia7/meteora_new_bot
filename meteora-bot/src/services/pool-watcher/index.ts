@@ -5,7 +5,7 @@ import { PoolInfo } from '../../shared/types';
 
 const METEORA_API = 'https://dlmm-api.meteora.ag';
 
-export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[], hasTargetFee: boolean) => void;
+export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[]) => void;
 export type PoolTimeoutCallback = (tokenAddress: string, tokenSymbol: string) => void;
 
 interface WatchEntry {
@@ -14,7 +14,8 @@ interface WatchEntry {
   startedAt: number;
   intervalHandle: NodeJS.Timeout;
   timeoutHandle: NodeJS.Timeout;
-  notifiedAlternatives: boolean;
+  /** Адреса пулов, о которых уже уведомили — чтобы не спамить тем же набором. */
+  notifiedPoolAddrs: Set<string>;
 }
 
 export class PoolWatcher {
@@ -57,7 +58,7 @@ export class PoolWatcher {
       startedAt,
       intervalHandle,
       timeoutHandle,
-      notifiedAlternatives: false,
+      notifiedPoolAddrs: new Set<string>(),
     });
 
     // Run immediately on first check
@@ -83,34 +84,25 @@ export class PoolWatcher {
 
     try {
       const pools = await this.fetchPools(tokenAddress);
-      if (pools.length === 0) return;
+      if (pools.length === 0) return; // пулов пока нет — продолжаем ждать до таймаута
 
-      // ТЗ 2.2: идеальный пул = DLMM-Dynamic + fee 5% (500 bps) + binStep 80/100/125.
-      // Раньше код фильтровал только по fee и игнорировал binStep/тип.
-      const preferred = new Set(config.poolWatcher.preferredBinSteps);
-      const isIdealPool = (p: PoolInfo): boolean =>
-        p.feeBps === config.poolWatcher.targetFeeBps && preferred.has(p.binStep);
+      // Решение заказчика: НЕ фильтруем по стратегии. Показываем ВСЕ DLMM-пулы
+      // по токену (со всеми fee-%), а человек выбирает, в какой войти и входить ли
+      // вообще. Стратегийный пул лишь помечается ⭐ на стороне бота.
+      //
+      // Не спамим: уведомляем только если появились пулы, которых ещё не показывали.
+      const hasNew = pools.some((p) => !entry.notifiedPoolAddrs.has(p.address));
+      if (!hasNew) return;
 
-      const idealPools = pools.filter(isIdealPool);
-      if (idealPools.length > 0) {
-        logger.info(
-          `Found ideal pool for ${entry.tokenSymbol}: fee=${config.poolWatcher.targetFeeBps / 100}%, ` +
-            `binStep ∈ {${[...preferred].join(',')}}`
-        );
-        this.stopWatching(tokenAddress);
-        for (const cb of this.onFoundCallbacks) cb(tokenAddress, idealPools, true);
-        return;
-      }
-
-      // Альтернативы существуют, но без нужных параметров — уведомляем один раз
-      // и продолжаем ждать идеальный пул до таймаута (2 часа).
-      if (!entry.notifiedAlternatives && pools.length > 0) {
-        entry.notifiedAlternatives = true;
-        logger.info(
-          `No ideal pool for ${entry.tokenSymbol}, found ${pools.length} alternative pools`
-        );
-        for (const cb of this.onFoundCallbacks) cb(tokenAddress, pools, false);
-      }
+      for (const p of pools) entry.notifiedPoolAddrs.add(p.address);
+      logger.info(
+        `Pools for ${entry.tokenSymbol}: ${pools.length} DLMM pool(s), notifying for manual choice`
+      );
+      // Watch НЕ останавливаем — вход/отмену решает пользователь (кнопки):
+      //   • «войти» → main.ts вызовет stopWatching при открытии позиции;
+      //   • «не входить» → main.ts вызовет stopWatching + cancel;
+      //   • «ждать ещё» → продолжаем поллинг, повторно уведомим только о новых пулах.
+      for (const cb of this.onFoundCallbacks) cb(tokenAddress, pools);
     } catch (err) {
       logger.error(`Pool check error for ${tokenAddress}: ${err}`);
     }
@@ -165,4 +157,22 @@ interface MeteoraPair {
   current_price?: string;
   pool_type?: string;
   type?: string;
+}
+
+/**
+ * Текущий TVL (USD) одного DLMM-пула. Используется panic-detector'ом (фактор
+ * F5 tvl_drop). Возвращает null при ошибке/отсутствии данных — вызывающий код
+ * сам решает, как трактовать «неизвестно».
+ */
+export async function fetchPoolTvl(poolAddress: string): Promise<number | null> {
+  try {
+    const resp = await meteoraQ.get<{ liquidity?: string }>(`${METEORA_API}/pair/${poolAddress}`, {
+      timeout: 8000,
+    });
+    const tvl = parseFloat(resp.data?.liquidity ?? '');
+    return Number.isFinite(tvl) ? tvl : null;
+  } catch (err) {
+    logger.warn(`fetchPoolTvl error for ${poolAddress}: ${err}`);
+    return null;
+  }
 }

@@ -3,9 +3,10 @@ import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { Positions, recordSignal } from '../../shared/repositories';
 import { ExitSignal, Position } from '../../shared/types';
-import { LpManager } from '../lp-manager';
 import { ScannerService } from '../scanner';
 import { ExitStrategy } from '../exit-strategy';
+import { SecurityChecker } from '../security';
+import { fetchPoolTvl } from '../pool-watcher';
 
 type ExitCallback = (signal: ExitSignal) => void;
 
@@ -16,19 +17,21 @@ type ExitCallback = (signal: ExitSignal) => void;
  * только когда одновременно (внутри окна `PANIC_TIME_WINDOW_MIN`) активны
  * ≥ `PANIC_REQUIRED_FACTORS` независимых негативных факторов:
  *
- *   F1 (volume_drop):   24h-объём токена сильно ниже порога сканера.
- *                       Точная "падение от 4ч-среднего" приедет в Фазе 3 (OHLCV).
- *   F2 (rsi_low):       RSI(14) текущей истории цен ниже PANIC_RSI_THRESHOLD.
- *   F3 (price_from_ath): просадка от ATH-в-позиции ≥ PANIC_PRICE_DROP_FROM_ATH_PCT.
- *   F4 (security_*):    Фаза 4 — security re-check показал ухудшение.
- *   F5 (tvl_drop):      Фаза 4 — TVL пула резко упал.
+ *   F1 (volume_drop):     24h-объём токена сильно ниже порога сканера.
+ *                         Точная "падение от 4ч-среднего" приедет в Фазе 3 (OHLCV).
+ *   F2 (rsi_low):         RSI(14) текущей истории цен ниже PANIC_RSI_THRESHOLD.
+ *   F3 (price_from_ath):  просадка от ATH-в-позиции ≥ PANIC_PRICE_DROP_FROM_ATH_PCT.
+ *   F4 (security_degraded): фоновый re-check показал hard-fail (honeypot/authority/
+ *                         RugCheck danger) — отложенный руг. Троттлится SECURITY_RECHECK_MIN.
+ *   F5 (tvl_drop):        TVL пула упал ≥ PANIC_TVL_DROP_PCT от пика (вытаскивают
+ *                         ликвидность). Троттлится так же.
  *
  * Каждый раз, когда фактор активен, мы помечаем текущее время как момент его
  * последнего «срабатывания». Считаем активными те факторы, последний таймстамп
  * которых ≥ now − window.
  */
 
-type FactorName = 'volume_drop' | 'rsi_low' | 'price_from_ath';
+type FactorName = 'volume_drop' | 'rsi_low' | 'price_from_ath' | 'security_degraded' | 'tvl_drop';
 
 interface FactorState {
   lastActiveAt: number; // ms timestamp
@@ -36,6 +39,11 @@ interface FactorState {
 
 interface PositionState {
   factors: Map<FactorName, FactorState>;
+  /** Троттлинг дорогих проверок (внешние API). */
+  lastSecurityCheckAt: number; // ms
+  lastTvlCheckAt: number; // ms
+  /** Максимальный наблюдённый TVL — база для F5 (drop меряем от пика). */
+  baselineTvl: number;
 }
 
 export class PanicDetector {
@@ -44,9 +52,9 @@ export class PanicDetector {
   private callbacks: ExitCallback[] = [];
 
   constructor(
-    private lpManager: LpManager,
     private scanner: ScannerService,
-    private exitStrategy: ExitStrategy
+    private exitStrategy: ExitStrategy,
+    private security: SecurityChecker
   ) {}
 
   onExit(cb: ExitCallback): void {
@@ -130,7 +138,45 @@ export class PanicDetector {
       }
     }
 
-    // F4 / F5 — добавятся в Фазе 4 (security re-check, TVL-наблюдение).
+    // F4 / F5 — дорогие внешние проверки, троттлим (SECURITY_RECHECK_MIN), чтобы
+    // не выжечь лимиты GMGN/RugCheck/BubbleMaps/Meteora каждые 30с на позицию.
+    const ps = this.getOrCreate(position.id);
+    const recheckMs = config.security.recheckMin * 60_000;
+
+    // F4 security_degraded — свежий re-check; hard-fail = отложенный руг.
+    if (now - ps.lastSecurityCheckAt >= recheckMs) {
+      ps.lastSecurityCheckAt = now;
+      try {
+        const sec = await this.security.check(position.tokenAddress, { bypassCache: true });
+        if (sec.hardFail) {
+          logger.warn(
+            `Security degraded for ${position.tokenSymbol} (${position.id}): ${sec.warnings.join('; ')}`
+          );
+          set('security_degraded');
+        }
+      } catch (err) {
+        logger.warn(`Security re-check failed for position ${position.id}: ${err}`);
+      }
+    }
+
+    // F5 tvl_drop — падение TVL пула от наблюдённого пика.
+    if (now - ps.lastTvlCheckAt >= recheckMs) {
+      ps.lastTvlCheckAt = now;
+      const tvl = await fetchPoolTvl(position.poolAddress);
+      if (tvl !== null && tvl > 0) {
+        if (tvl > ps.baselineTvl) ps.baselineTvl = tvl;
+        if (ps.baselineTvl > 0) {
+          const dropPct = ((ps.baselineTvl - tvl) / ps.baselineTvl) * 100;
+          if (dropPct >= config.panic.tvlDropPct) {
+            logger.warn(
+              `TVL drop for ${position.tokenSymbol} (${position.id}): ` +
+                `$${tvl.toFixed(0)} from peak $${ps.baselineTvl.toFixed(0)} (−${dropPct.toFixed(0)}%)`
+            );
+            set('tvl_drop');
+          }
+        }
+      }
+    }
   }
 
   private activeFactors(positionId: number): FactorName[] {
@@ -147,7 +193,7 @@ export class PanicDetector {
   private getOrCreate(positionId: number): PositionState {
     let ps = this.state.get(positionId);
     if (!ps) {
-      ps = { factors: new Map() };
+      ps = { factors: new Map(), lastSecurityCheckAt: 0, lastTvlCheckAt: 0, baselineTvl: 0 };
       this.state.set(positionId, ps);
     }
     return ps;

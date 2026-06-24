@@ -1,5 +1,6 @@
-import { BollingerBands, RSI } from 'technicalindicators';
+import { RSI } from 'technicalindicators';
 import { config } from '../../shared/config';
+import { isNewAth, isFeeTarget, bollingerUpper } from './signals';
 import { logger } from '../../shared/logger';
 import { Positions, PriceHistoryRepo, recordSignal } from '../../shared/repositories';
 import { Position, ExitSignal } from '../../shared/types';
@@ -11,6 +12,7 @@ type ExitCallback = (signal: ExitSignal) => void;
 export interface DegradationWarning {
   positionId: number;
   tokenSymbol: string;
+  tokenAddress: string;
   rsi: number;
   volume24h: number;
   message: string;
@@ -122,7 +124,7 @@ export class ExitStrategy {
 
     // 1. Fee target — авто-выход (тейк-профит).
     const feeRatio = await this.lpManager.getFeesRatio(position);
-    if (feeRatio >= config.exit.feeThreshold) {
+    if (isFeeTarget(feeRatio, config.exit.feeThreshold)) {
       return {
         positionId: position.id,
         reason: 'fee_target',
@@ -147,11 +149,7 @@ export class ExitStrategy {
     //    Раньше код бампил history.ath ДО сравнения → условие никогда не срабатывало.
     //    Сейчас: сравниваем с lastSignalledAth (или ath, если ещё не сигналили).
     const referenceAth = history.lastSignalledAth || history.ath;
-    if (
-      history.prices.length > 5 &&
-      referenceAth > 0 &&
-      currentPrice > referenceAth * 1.05
-    ) {
+    if (isNewAth(currentPrice, referenceAth, history.prices.length)) {
       history.ath = currentPrice;
       history.lastSignalledAth = currentPrice;
       return {
@@ -166,20 +164,17 @@ export class ExitStrategy {
     if (history.prices.length < config.exit.bollingerPeriod + 1) return null;
 
     // 3. Bollinger Bands breakout — авто-выход (тейк-профит).
-    const bbResult = BollingerBands.calculate({
-      period: config.exit.bollingerPeriod,
-      stdDev: config.exit.bollingerStdDev,
-      values: history.prices,
-    });
-    if (bbResult.length > 0) {
-      const lastBb = bbResult[bbResult.length - 1];
-      if (currentPrice > lastBb.upper) {
-        return {
-          positionId: position.id,
-          reason: 'bollinger_breakout',
-          details: `Price $${currentPrice.toFixed(8)} > BB upper $${lastBb.upper.toFixed(8)}`,
-        };
-      }
+    const upper = bollingerUpper(
+      history.prices,
+      config.exit.bollingerPeriod,
+      config.exit.bollingerStdDev
+    );
+    if (upper !== null && currentPrice > upper) {
+      return {
+        positionId: position.id,
+        reason: 'bollinger_breakout',
+        details: `Price $${currentPrice.toFixed(8)} > BB upper $${upper.toFixed(8)}`,
+      };
     }
 
     // 4. Деградация графика → ПРЕДУПРЕЖДЕНИЕ, не авто-выход.
@@ -199,6 +194,7 @@ export class ExitStrategy {
               cb({
                 positionId: position.id,
                 tokenSymbol: position.tokenSymbol,
+                tokenAddress: position.tokenAddress,
                 rsi: lastRsi,
                 volume24h: tokenInfo.volume24h,
                 message:

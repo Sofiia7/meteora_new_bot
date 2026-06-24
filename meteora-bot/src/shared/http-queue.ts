@@ -26,12 +26,11 @@ export class HttpQueue {
     private maxRetries: number = 3
   ) {}
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async get<T = any>(url: string, cfg?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
     return this.enqueue(() => axios.get<T>(url, cfg));
   }
 
-  async post<T = any>( // eslint-disable-line @typescript-eslint/no-explicit-any
+  async post<T = any>(
     url: string,
     body: unknown,
     cfg?: AxiosRequestConfig

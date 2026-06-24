@@ -2,7 +2,8 @@ import { Telegraf, Markup, Context } from 'telegraf';
 import { config } from '../shared/config';
 import { logger } from '../shared/logger';
 import { Positions, WatchedTokens } from '../shared/repositories';
-import { SecurityResult, TokenInfo, PoolInfo, Position, ExitReason } from '../shared/types';
+import { SecurityResult, TokenInfo, PoolInfo, Position, ExitReason, AiVerdict } from '../shared/types';
+import { tokenLinks, meteoraPoolUrl, ResourceLink } from '../shared/links';
 
 export class TelegramBot {
   readonly bot: Telegraf;
@@ -16,6 +17,10 @@ export class TelegramBot {
   onManualScan?: (address: string) => Promise<void>;
   onExitPosition?: (positionId: number) => Promise<void>;
   onContinueWatching?: (tokenAddress: string, continueWatching: boolean) => void;
+  /** «Не входить» в пул / убрать из ватчлиста — остановить наблюдение и отменить. */
+  onCancelWatch?: (tokenAddress: string) => void;
+  /** Ручное добавление токена в ватчлист (/watch <CA>). */
+  onAddWatch?: (address: string) => Promise<void>;
 
   constructor() {
     this.bot = new Telegraf(config.telegram.botToken);
@@ -67,79 +72,132 @@ export class TelegramBot {
     this.bot.stop('SIGTERM');
   }
 
+  // ─── Resource links ────────────────────────────────────────────────────────
+
+  /**
+   * Строка кликабельных ссылок на ресурсы (инлайн в тексте — выбор заказчика).
+   * Для сообщений с пулом передаём poolAddress → добавляется ссылка на Meteora.
+   */
+  private resourceLine(ca: string, pairAddress?: string, poolAddress?: string): string {
+    const links = tokenLinks(ca, pairAddress);
+    if (poolAddress) {
+      const m = meteoraPoolUrl(poolAddress);
+      if (m) links.push({ label: 'Meteora', url: m });
+    }
+    return this.linksLineHtml(links);
+  }
+
+  private linksLineHtml(links: ResourceLink[]): string {
+    if (links.length === 0) return '';
+    return (
+      '🔗 ' +
+      links.map((l) => `<a href="${escAttr(l.url)}">${escHtml(l.label)}</a>`).join(' · ')
+    );
+  }
+
   // ─── Outbound notifications ────────────────────────────────────────────────
 
-  async notifyNewToken(token: TokenInfo, security: SecurityResult): Promise<void> {
+  async notifyNewToken(token: TokenInfo, security: SecurityResult, ai?: AiVerdict): Promise<void> {
     const statusIcon = security.passed ? '✅' : '⚠️';
     const text = [
-      `${statusIcon} *Найден токен: ${escMd(token.symbol)}*`,
-      `CA: \`${token.address}\``,
+      `${statusIcon} <b>Найден токен: ${escHtml(token.symbol)}</b>`,
+      `CA: <code>${escHtml(token.address)}</code>`,
+      this.resourceLine(token.address, token.pairAddress),
       '',
       `💰 MarketCap: $${fmt(token.marketCap)}`,
       `📊 Volume 24h: $${fmt(token.volume24h)}`,
       `💵 Price: $${token.priceUsd.toFixed(8)}`,
       `💧 Liquidity: $${fmt(token.liquidity)}`,
       '',
+      `🧮 Security score: ${security.score}/100${security.hardFail ? ' — ❌ HARD-FAIL' : ''}`,
       `🔐 GMGN fees: ${security.gmgnFeesSol.toFixed(1)} SOL`,
-      `🛡 RugCheck: ${security.rugcheckStatus}`,
+      `🛡 RugCheck: ${escHtml(security.rugcheckStatus)}`,
       `👥 Топ холдеры: ${security.holderConcentration.toFixed(1)}%`,
       `🐦 Twitter: ${security.twitterActive ? 'есть' : 'нет'}`,
     ];
 
+    const flags: string[] = [];
+    if (security.honeypot) flags.push('🍯 Honeypot');
+    if (security.mintAuthorityActive) flags.push('🔓 Mint authority активна');
+    if (security.freezeAuthorityActive) flags.push('🧊 Freeze authority активна');
+    if (security.sourcesUnavailable.length > 0)
+      flags.push(`📡 Недоступны: ${escHtml(security.sourcesUnavailable.join(', '))}`);
+    if (flags.length > 0) text.push('', ...flags);
+
+    if (ai) {
+      const riskIcon = { low: '🟢', medium: '🟡', high: '🔴', unknown: '⚪' }[ai.risk];
+      text.push('', `🤖 <b>AI-аналитик</b> (${riskIcon} ${ai.risk}): ${escHtml(ai.verdict)}`);
+    }
+
     if (security.warnings.length > 0) {
-      text.push('', '⚠️ *Предупреждения:*');
-      security.warnings.forEach((w) => text.push(`  • ${escMd(w)}`));
+      text.push('', '⚠️ <b>Предупреждения:</b>');
+      security.warnings.forEach((w) => text.push(`  • ${escHtml(w)}`));
     }
 
     await this.sendMessage(text.join('\n'));
   }
 
-  async notifyPoolFound(
-    token: TokenInfo,
-    pools: PoolInfo[],
-    hasTargetFee: boolean
-  ): Promise<void> {
-    const selectionKey = token.address;
-    this.pendingPoolSelections.set(selectionKey, {
+  /**
+   * Все DLMM-пулы по токену — список + кнопка входа на каждый + «ждать»/«не входить».
+   * Никакой авто-фильтрации: выбирает человек. ⭐ помечает пул, совпадающий со
+   * стратегией (fee 5% + binStep 80/100/125) — только пометка, войти можно в любой.
+   */
+  async notifyPoolFound(token: TokenInfo, pools: PoolInfo[]): Promise<void> {
+    this.pendingPoolSelections.set(token.address, {
       pools,
       tokenAddress: token.address,
       tokenSymbol: token.symbol,
     });
 
-    if (hasTargetFee) {
-      const pool = pools[0];
-      const text = [
-        `🎯 *Пул найден: ${escMd(token.symbol)}*`,
-        `Pool: \`${pool.address}\``,
-        `Fee: ${(pool.feeBps / 100).toFixed(2)}% | BinStep: ${pool.binStep}`,
-        `TVL: $${fmt(pool.tvl)}`,
-      ].join('\n');
+    const shown = pools.slice(0, config.poolWatcher.buttonsMax);
+    const preferred = new Set(config.poolWatcher.preferredBinSteps);
+    const isStrategy = (p: PoolInfo): boolean =>
+      p.feeBps === config.poolWatcher.targetFeeBps && preferred.has(p.binStep);
 
-      await this.sendMessageWithButtons(text, [
-        [Markup.button.callback(`✅ Войти в пул`, `enter_pool:${token.address}:${pool.address}`)],
-        [Markup.button.callback(`❌ Пропустить`, `skip_pool:${token.address}`)],
-      ]);
-    } else {
-      // Alternative pools selection
-      const text = [
-        `⚠️ *Пул 5% не найден для ${escMd(token.symbol)}*`,
-        `Доступные варианты:`,
-      ].join('\n');
-
-      const buttons = pools.slice(0, 5).map((pool) => [
-        Markup.button.callback(
-          `${(pool.feeBps / 100).toFixed(2)}% | step:${pool.binStep} | TVL:$${fmtShort(pool.tvl)}`,
-          `enter_pool:${token.address}:${pool.address}`
-        ),
-      ]);
-      buttons.push([Markup.button.callback(`❌ Не входить`, `skip_pool:${token.address}`)]);
-
-      await this.sendMessageWithButtons(text, buttons);
+    const lines: string[] = [
+      `🪙 <b>${escHtml(token.symbol)}</b> — найдены DLMM-пулы`,
+      `CA: <code>${escHtml(token.address)}</code>`,
+      this.resourceLine(token.address, token.pairAddress),
+      '',
+      'Доступные пулы:',
+    ];
+    shown.forEach((p, i) => {
+      const star = isStrategy(p) ? '⭐' : '▫️';
+      const mUrl = meteoraPoolUrl(p.address);
+      const meteora = mUrl ? ` · <a href="${escAttr(mUrl)}">Meteora↗</a>` : '';
+      lines.push(
+        `${star} ${i + 1}) ${(p.feeBps / 100).toFixed(2)}% · step${p.binStep} · ` +
+          `TVL $${fmtShort(p.tvl)}${meteora}`
+      );
+    });
+    if (pools.length > shown.length) {
+      lines.push('', `…и ещё ${pools.length - shown.length} пул(ов) — см. ссылки Meteora выше`);
     }
+    lines.push('', '⭐ = совпадает со стратегией (5% + binStep 80/100/125)');
+
+    const buttons = shown.map((p, i) => [
+      Markup.button.callback(
+        `✅ ${i + 1}) ${(p.feeBps / 100).toFixed(2)}% / step${p.binStep}`,
+        `enter_pool:${token.address}:${i}`
+      ),
+    ]);
+    buttons.push([
+      Markup.button.callback('⏳ Ждать ещё', `wait_pool:${token.address}`),
+      Markup.button.callback('❌ Не входить', `skip_pool:${token.address}`),
+    ]);
+
+    await this.sendMessageWithButtons(lines.join('\n'), buttons);
   }
 
   async notifyPoolTimeout(tokenAddress: string, tokenSymbol: string): Promise<void> {
-    const text = `⏰ *Пул не найден за 2 часа*\nТокен: ${escMd(tokenSymbol)}\nПродолжать отслеживание?`;
+    const text = [
+      `⏰ <b>Пул не найден за 2 часа</b>`,
+      `Токен: ${escHtml(tokenSymbol)}`,
+      `CA: <code>${escHtml(tokenAddress)}</code>`,
+      this.resourceLine(tokenAddress),
+      '',
+      `Продолжать отслеживание?`,
+    ].join('\n');
     await this.sendMessageWithButtons(text, [
       [
         Markup.button.callback('✅ Да', `continue_watch:${tokenAddress}:yes`),
@@ -150,9 +208,11 @@ export class TelegramBot {
 
   async notifyPositionOpened(position: Position): Promise<void> {
     const text = [
-      `🟢 *Позиция открыта: ${escMd(position.tokenSymbol)}*`,
-      `CA: \`${position.tokenAddress}\``,
-      `Pool: \`${position.poolAddress}\``,
+      `🟢 <b>Позиция открыта: ${escHtml(position.tokenSymbol)}</b>`,
+      `CA: <code>${escHtml(position.tokenAddress)}</code>`,
+      `Pool: <code>${escHtml(position.poolAddress)}</code>`,
+      this.resourceLine(position.tokenAddress, undefined, position.poolAddress),
+      '',
       `SOL: ${position.solAmount}`,
       `Fee: ${(position.feeBps / 100).toFixed(2)}%`,
       `Entry price: $${position.entryPrice.toFixed(8)}`,
@@ -176,8 +236,10 @@ export class TelegramBot {
       manual: '🖐 Ручное закрытие',
     };
     const text = [
-      `🔴 *Позиция закрыта: ${escMd(position.tokenSymbol)}*`,
-      `CA: \`${position.tokenAddress}\``,
+      `🔴 <b>Позиция закрыта: ${escHtml(position.tokenSymbol)}</b>`,
+      `CA: <code>${escHtml(position.tokenAddress)}</code>`,
+      this.resourceLine(position.tokenAddress, undefined, position.poolAddress),
+      '',
       `Причина: ${reasonText[reason]}`,
       `PnL: ${pnlSign}${(position.pnlSol ?? 0).toFixed(4)} SOL`,
     ].join('\n');
@@ -185,10 +247,16 @@ export class TelegramBot {
   }
 
   /** Предупреждение о деградации графика — без авто-выхода, с кнопкой ручного выхода. */
-  async notifyDegradation(positionId: number, tokenSymbol: string, message: string): Promise<void> {
+  async notifyDegradation(
+    positionId: number,
+    tokenSymbol: string,
+    message: string,
+    tokenAddress: string
+  ): Promise<void> {
     const text = [
-      `⚠️ *Предупреждение: ${escMd(tokenSymbol)}*`,
-      `${escMd(message)}`,
+      `⚠️ <b>Предупреждение: ${escHtml(tokenSymbol)}</b>`,
+      escHtml(message),
+      this.resourceLine(tokenAddress),
       ``,
       `Авто-выхода по одной деградации нет (решение заказчика).`,
       `Хочешь закрыть позицию #${positionId} вручную?`,
@@ -199,14 +267,27 @@ export class TelegramBot {
     ]);
   }
 
+  /** Повторное уведомление по новому ATH (+X% над прошлым уведомлением). */
+  async notifyAthRenotify(token: TokenInfo, newAth: number, prevAth: number): Promise<void> {
+    const text = [
+      `🚀 <b>Новый ATH +${config.athRenotify.pct}%: ${escHtml(token.symbol)}</b>`,
+      `CA: <code>${escHtml(token.address)}</code>`,
+      this.resourceLine(token.address, token.pairAddress),
+      '',
+      `Цена: $${newAth.toFixed(8)} (прошлый ATH-уведом: $${prevAth.toFixed(8)})`,
+    ].join('\n');
+    await this.sendMessage(text);
+  }
+
   async notifyError(message: string): Promise<void> {
-    await this.sendMessage(`❌ *Ошибка:* ${escMd(message)}`);
+    await this.sendMessage(`❌ <b>Ошибка:</b> ${escHtml(message)}`);
   }
 
   async sendMessage(text: string): Promise<void> {
     try {
       await this.bot.telegram.sendMessage(config.telegram.chatId, text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
       });
     } catch (err) {
       logger.error(`TG sendMessage error: ${err}`);
@@ -219,7 +300,8 @@ export class TelegramBot {
   ): Promise<void> {
     try {
       await this.bot.telegram.sendMessage(config.telegram.chatId, text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
         ...Markup.inlineKeyboard(buttons),
       });
     } catch (err) {
@@ -232,11 +314,13 @@ export class TelegramBot {
   private setupCommands(): void {
     this.bot.command('start', (ctx) => {
       ctx.reply(
-        '🤖 *Meteora LP Bot*\n\n' +
+        '🤖 <b>Meteora LP Bot</b>\n\n' +
           '/status — статус бота\n' +
           '/positions — активные позиции\n' +
-          '/scan <CA> — проверить токен вручную',
-        { parse_mode: 'Markdown' }
+          '/watchlist — список наблюдаемых токенов\n' +
+          '/watch &lt;CA&gt; — добавить токен в наблюдение\n' +
+          '/scan &lt;CA&gt; — проверить токен вручную',
+        { parse_mode: 'HTML' }
       );
     });
 
@@ -245,10 +329,10 @@ export class TelegramBot {
       const watching = WatchedTokens.countWatching();
 
       ctx.reply(
-        `🤖 *Бот работает*\n` +
+        `🤖 <b>Бот работает</b>\n` +
           `📊 Активных позиций: ${active}/${config.lp.maxPositions}\n` +
           `👀 Отслеживается токенов: ${watching}`,
-        { parse_mode: 'Markdown' }
+        { parse_mode: 'HTML' }
       );
     });
 
@@ -262,18 +346,59 @@ export class TelegramBot {
 
       const lines = positions.map((p, i) => {
         const age = Math.floor((Date.now() / 1000 - p.openedAt) / 60);
-        return `*${i + 1}. ${escMd(p.tokenSymbol)}*\n  Fee: ${(p.feeBps / 100).toFixed(2)}% | SOL: ${p.solAmount} | ${age}м`;
+        return (
+          `<b>${i + 1}. ${escHtml(p.tokenSymbol)}</b>\n` +
+          `  Fee: ${(p.feeBps / 100).toFixed(2)}% | SOL: ${p.solAmount} | ${age}м\n` +
+          `  ${this.resourceLine(p.tokenAddress, undefined, p.poolAddress)}`
+        );
       });
 
-      const text = `📊 *Активные позиции:*\n\n${lines.join('\n\n')}`;
+      const text = `📊 <b>Активные позиции:</b>\n\n${lines.join('\n\n')}`;
       const closeButtons = positions.map((p) => [
         Markup.button.callback(`❌ Закрыть ${p.tokenSymbol}`, `close_position:${p.id}`),
       ]);
 
       await ctx.reply(text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
         ...Markup.inlineKeyboard(closeButtons),
       });
+    });
+
+    this.bot.command('watchlist', async (ctx) => {
+      const rows = WatchedTokens.listActiveWatchlist();
+      if (rows.length === 0) {
+        ctx.reply('Ватчлист пуст. Добавить: /watch <CA>');
+        return;
+      }
+
+      const lines = rows.map((w, i) => {
+        const age = Math.floor((Date.now() / 1000 - w.startedAt) / 60);
+        return (
+          `<b>${i + 1}. ${escHtml(w.tokenSymbol)}</b> — ${w.status}, ${age}м\n` +
+          `  <code>${escHtml(w.tokenAddress)}</code>\n` +
+          `  ${this.resourceLine(w.tokenAddress)}`
+        );
+      });
+      const removeButtons = rows.map((w) => [
+        Markup.button.callback(`🗑 Убрать ${w.tokenSymbol}`, `wl_remove:${w.tokenAddress}`),
+      ]);
+
+      await ctx.reply(`👀 <b>Ватчлист:</b>\n\n${lines.join('\n\n')}`, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...Markup.inlineKeyboard(removeButtons),
+      });
+    });
+
+    this.bot.command('watch', async (ctx) => {
+      const ca = ctx.message.text.split(' ').slice(1).join('').trim();
+      if (!ca) {
+        ctx.reply('Укажи CA токена: /watch <адрес>');
+        return;
+      }
+      ctx.reply(`➕ Добавляю в наблюдение <code>${escHtml(ca)}</code>...`, { parse_mode: 'HTML' });
+      this.onAddWatch?.(ca);
     });
 
     this.bot.command('scan', async (ctx) => {
@@ -290,9 +415,11 @@ export class TelegramBot {
   // ─── Callback handlers ─────────────────────────────────────────────────────
 
   private setupCallbackHandlers(): void {
-    this.bot.action(/^enter_pool:(.+):(.+)$/, async (ctx) => {
+    // Вход в конкретный пул по индексу в списке (callback_data ограничен 64 байтами,
+    // поэтому передаём индекс, а не адрес пула).
+    this.bot.action(/^enter_pool:(.+):(\d+)$/, async (ctx) => {
       const tokenAddress = ctx.match[1];
-      const poolAddress = ctx.match[2];
+      const idx = parseInt(ctx.match[2], 10);
       const selection = this.pendingPoolSelections.get(tokenAddress);
 
       if (!selection) {
@@ -300,26 +427,54 @@ export class TelegramBot {
         return;
       }
 
-      const pool = selection.pools.find((p) => p.address === poolAddress);
+      const pool = selection.pools[idx];
       if (!pool) {
         await ctx.answerCbQuery('Пул не найден');
         return;
       }
 
       await ctx.answerCbQuery('Входим в пул...');
-      await ctx.editMessageText(
-        `⏳ Входим в пул ${escMd(selection.tokenSymbol)}...`,
-        { parse_mode: 'Markdown' }
-      );
+      await ctx.editMessageText(`⏳ Входим в пул ${escHtml(selection.tokenSymbol)}...`, {
+        parse_mode: 'HTML',
+      });
       this.pendingPoolSelections.delete(tokenAddress);
       this.onEnterPool?.(tokenAddress, pool);
     });
 
+    // «Ждать ещё» — продолжаем наблюдение, повторно уведомим только о новых пулах.
+    this.bot.action(/^wait_pool:(.+)$/, async (ctx) => {
+      const tokenAddress = ctx.match[1];
+      this.pendingPoolSelections.delete(tokenAddress);
+      await ctx.answerCbQuery('Жду новые пулы');
+      try {
+        await ctx.editMessageText('⏳ Продолжаю наблюдение — уведомлю о новых пулах');
+      } catch {
+        /* ignore */
+      }
+    });
+
+    // «Не входить» — останавливаем наблюдение и убираем из ватчлиста.
     this.bot.action(/^skip_pool:(.+)$/, async (ctx) => {
       const tokenAddress = ctx.match[1];
       this.pendingPoolSelections.delete(tokenAddress);
-      await ctx.answerCbQuery('Пропущено');
-      await ctx.editMessageText('❌ Пул пропущен');
+      this.onCancelWatch?.(tokenAddress);
+      await ctx.answerCbQuery('Не входим, наблюдение остановлено');
+      try {
+        await ctx.editMessageText('❌ Не входим. Токен снят с наблюдения.');
+      } catch {
+        /* ignore */
+      }
+    });
+
+    this.bot.action(/^wl_remove:(.+)$/, async (ctx) => {
+      const tokenAddress = ctx.match[1];
+      this.onCancelWatch?.(tokenAddress);
+      await ctx.answerCbQuery('Убрано из ватчлиста');
+      try {
+        await ctx.editMessageText('🗑 Токен убран из ватчлиста');
+      } catch {
+        /* ignore */
+      }
     });
 
     this.bot.action(/^continue_watch:(.+):(yes|no)$/, async (ctx) => {
@@ -369,7 +524,9 @@ export class TelegramBot {
     this.bot.action(/^force_enter:(.+)$/, async (ctx) => {
       const tokenAddress = ctx.match[1];
       await ctx.answerCbQuery('Запускаем наблюдение за пулом');
-      await ctx.editMessageText(`⚠️ Принудительный вход для \`${tokenAddress}\``, { parse_mode: 'Markdown' });
+      await ctx.editMessageText(`⚠️ Принудительный вход для <code>${escHtml(tokenAddress)}</code>`, {
+        parse_mode: 'HTML',
+      });
       // Trigger pool watching despite security warnings
       this.onManualScan?.(`force:${tokenAddress}`);
     });
@@ -390,6 +547,12 @@ function fmtShort(n: number): string {
   return n.toFixed(0);
 }
 
-function escMd(text: string): string {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+/** Экранирование для parse_mode HTML (тело сообщения). */
+function escHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Экранирование для значения href="…". */
+function escAttr(text: string): string {
+  return escHtml(text).replace(/"/g, '&quot;');
 }

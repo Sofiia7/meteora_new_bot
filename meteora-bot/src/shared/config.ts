@@ -85,11 +85,21 @@ export const config = {
   poolWatcher: {
     checkIntervalMs: intEnv('POOL_CHECK_INTERVAL_MS', 30000),
     watchTimeoutMs: intEnv('POOL_WATCH_TIMEOUT_MS', 7200000),
+    // targetFeeBps + preferredBinSteps больше НЕ фильтруют пулы — мы показываем
+    // все DLMM-пулы по токену. Они нужны только чтобы пометить ⭐ тот пул,
+    // что совпадает с целевой стратегией (решение заказчика: выбирает человек).
     targetFeeBps: 500,
     preferredBinSteps: [80, 100, 125],
+    // Сколько пулов максимум показывать кнопками (Telegram-клавиатура + читаемость).
+    buttonsMax: intEnv('POOL_BUTTONS_MAX', 8),
   },
   security: {
     minGmgnFeesSol: numEnv('MIN_GMGN_FEES_SOL', 30),
+    // Score-based решение (Фаза 4): токен проходит, если нет hard-fail И score>=min.
+    minScore: intEnv('MIN_SECURITY_SCORE', 60),
+    maxHolderConcentrationPct: numEnv('MAX_HOLDER_CONCENTRATION_PCT', 50),
+    // Как часто перепроверять security активной позиции (panic-фактор F4). API-лимиты!
+    recheckMin: intEnv('SECURITY_RECHECK_MIN', 5),
   },
   exit: {
     // Solo-сигналы → авто-выход (тейк-профиты).
@@ -121,6 +131,30 @@ export const config = {
   chartHealth: {
     minScore: intEnv('MIN_HEALTH_SCORE', 65),
     maxAthDistancePct: numEnv('MAX_ATH_DISTANCE_PCT', 30),
+  },
+  // Локальный AI-аналитик (Фаза 4.1). OpenAI-совместимый эндпоинт (Ollama/LM Studio
+  // /vLLM). По умолчанию ВЫКЛ — бот полностью работает без LLM; включаешь, когда
+  // поднята локальная модель. Никаких облачных вызовов: всё крутится у тебя.
+  ai: {
+    enabled: boolEnv('AI_ENABLED', false),
+    baseUrl: process.env['AI_BASE_URL'] ?? 'http://localhost:11434/v1',
+    model: process.env['AI_MODEL'] ?? 'llama3.1',
+    apiKey: process.env['AI_API_KEY'] ?? '', // обычно не нужен для локалки
+    temperature: numEnv('AI_TEMPERATURE', 0.2),
+    maxTokens: intEnv('AI_MAX_TOKENS', 220),
+    timeoutMs: intEnv('AI_TIMEOUT_MS', 20000),
+  },
+  // Шаблоны ссылок на внешние ресурсы. {ca}=mint токена, {pair}=адрес пары,
+  // {pool}=адрес DLMM-пула. Любой можно переопределить через .env, если ресурс
+  // сменит формат URL — без правки кода (см. shared/links.ts).
+  links: {
+    gmgn: process.env['LINK_GMGN_TPL'] ?? 'https://gmgn.ai/sol/token/{ca}',
+    bubblemaps: process.env['LINK_BUBBLEMAPS_TPL'] ?? 'https://app.bubblemaps.io/sol/token/{ca}',
+    rugcheck: process.env['LINK_RUGCHECK_TPL'] ?? 'https://rugcheck.xyz/tokens/{ca}',
+    dexscreener: process.env['LINK_DEXSCREENER_TPL'] ?? 'https://dexscreener.com/solana/{pair}',
+    solscan: process.env['LINK_SOLSCAN_TPL'] ?? 'https://solscan.io/token/{ca}',
+    photon: process.env['LINK_PHOTON_TPL'] ?? 'https://photon-sol.tinyurl.com/en/lp/{pair}',
+    meteoraPool: process.env['LINK_METEORA_POOL_TPL'] ?? 'https://app.meteora.ag/dlmm/{pool}',
   },
   redis: {
     url: process.env['REDIS_URL'] ?? 'redis://localhost:6379',
