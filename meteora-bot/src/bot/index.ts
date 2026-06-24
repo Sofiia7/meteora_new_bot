@@ -181,26 +181,30 @@ export class TelegramBot {
       '',
       'Доступные пулы:',
     ];
+    const anyStrategy = shown.some(isStrategy);
     shown.forEach((p, i) => {
       const star = isStrategy(p) ? '⭐' : '▫️';
       const mUrl = meteoraPoolUrl(p.address);
       const meteora = mUrl ? ` · <a href="${escAttr(mUrl)}">Meteora↗</a>` : '';
-      lines.push(
-        `${star} ${i + 1}) ${(p.feeBps / 100).toFixed(2)}% · step${p.binStep} · ` +
-          `TVL $${fmtShort(p.tvl)}${meteora}`
-      );
+      // feeBps/binStep могут быть неизвестны (DexScreener их не отдаёт) — тогда «DLMM».
+      const spec =
+        p.feeBps > 0
+          ? `${(p.feeBps / 100).toFixed(2)}%${p.binStep > 0 ? ` · step${p.binStep}` : ''}`
+          : 'DLMM';
+      lines.push(`${star} ${i + 1}) ${spec} · TVL $${fmtShort(p.tvl)}${meteora}`);
     });
     if (pools.length > shown.length) {
-      lines.push('', `…и ещё ${pools.length - shown.length} пул(ов) — см. ссылки Meteora выше`);
+      lines.push('', `…и ещё ${pools.length - shown.length} пул(ов)`);
     }
-    lines.push('', '⭐ = совпадает со стратегией (5% + binStep 80/100/125)');
+    if (anyStrategy) lines.push('', '⭐ = совпадает со стратегией (5% + binStep 80/100/125)');
 
-    const buttons = shown.map((p, i) => [
-      Markup.button.callback(
-        `✅ ${i + 1}) ${(p.feeBps / 100).toFixed(2)}% / step${p.binStep}`,
-        `enter_pool:${token.address}:${i}`
-      ),
-    ]);
+    const buttons = shown.map((p, i) => {
+      const label =
+        p.feeBps > 0
+          ? `✅ ${i + 1}) ${(p.feeBps / 100).toFixed(2)}%${p.binStep > 0 ? ` / step${p.binStep}` : ''}`
+          : `✅ Войти в пул ${i + 1} (TVL $${fmtShort(p.tvl)})`;
+      return [Markup.button.callback(label, `enter_pool:${token.address}:${i}`)];
+    });
     buttons.push([
       Markup.button.callback('⏳ Ждать ещё', `wait_pool:${token.address}`),
       Markup.button.callback('❌ Не входить', `skip_pool:${token.address}`),

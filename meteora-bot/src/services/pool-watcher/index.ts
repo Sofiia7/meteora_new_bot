@@ -1,9 +1,12 @@
-import { meteoraQ } from '../../shared/http-queue';
+import { dexscreenerQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { PoolInfo } from '../../shared/types';
 
-const METEORA_API = 'https://dlmm-api.meteora.ag';
+// Источник пулов — DexScreener: dlmm-api.meteora.ag сейчас отдаёт 404 на все эндпоинты,
+// а DexScreener надёжно возвращает пары токена с пометкой dexId=meteora + labels=[DLMM].
+const DEXSCREENER_TOKEN_PAIRS = 'https://api.dexscreener.com/token-pairs/v1/solana';
+const DEXSCREENER_PAIR = 'https://api.dexscreener.com/latest/dex/pairs/solana';
 
 export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[]) => void;
 export type PoolTimeoutCallback = (tokenAddress: string, tokenSymbol: string) => void;
@@ -110,33 +113,23 @@ export class PoolWatcher {
 
   async fetchPools(tokenAddress: string): Promise<PoolInfo[]> {
     try {
-      const resp = await meteoraQ.get<{ data?: MeteoraPair[]; pairs?: MeteoraPair[] }>(
-        `${METEORA_API}/pair/all_with_pagination`,
-        {
-          params: { token: tokenAddress, limit: 20, page: 0 },
-          timeout: 10000,
-        }
+      const resp = await dexscreenerQ.get<DexPair[]>(
+        `${DEXSCREENER_TOKEN_PAIRS}/${tokenAddress}`,
+        { timeout: 10000 }
       );
-
-      const pairs: MeteoraPair[] = resp.data?.data ?? resp.data?.pairs ?? [];
+      const pairs: DexPair[] = Array.isArray(resp.data) ? resp.data : [];
       return pairs
-        .filter((p) => {
-          if (p.mint_x !== tokenAddress && p.mint_y !== tokenAddress) return false;
-          // ТЗ требует DLMM-Dynamic; всё остальное (AMM v1, DAMM) отбрасываем.
-          // Поле точно называется по-разному в зависимости от ответа API —
-          // принимаем оба варианта, как минимум исключаем AMM.
-          const tp = (p.pool_type ?? p.type ?? '').toString().toUpperCase();
-          if (tp && tp !== 'DLMM' && tp !== 'DYNAMIC') return false;
-          return true;
-        })
+        .filter((p) => p.dexId === 'meteora' && (p.labels ?? []).includes('DLMM'))
         .map((p) => ({
-          address: p.address,
+          address: p.pairAddress,
           tokenMint: tokenAddress,
-          feeBps: Math.round(parseFloat(p.base_fee_percentage ?? '0') * 100),
-          binStep: p.bin_step ?? 0,
-          tvl: parseFloat(p.liquidity ?? '0'),
-          activeBinId: p.active_bin_id ?? 0,
-          currentPrice: parseFloat(p.current_price ?? '0'),
+          // DexScreener не отдаёт fee-тир и bin_step Meteora-пула, а dlmm-api сейчас 404.
+          // 0 = «неизвестно»; бот показывает пул как DLMM без тира (см. notifyPoolFound).
+          feeBps: 0,
+          binStep: 0,
+          tvl: p.liquidity?.usd ?? 0,
+          activeBinId: 0,
+          currentPrice: parseFloat(p.priceUsd ?? '0') || 0,
         }))
         .sort((a, b) => b.tvl - a.tvl);
     } catch (err) {
@@ -146,31 +139,27 @@ export class PoolWatcher {
   }
 }
 
-interface MeteoraPair {
-  address: string;
-  mint_x: string;
-  mint_y: string;
-  base_fee_percentage?: string;
-  bin_step?: number;
-  liquidity?: string;
-  active_bin_id?: number;
-  current_price?: string;
-  pool_type?: string;
-  type?: string;
+interface DexPair {
+  dexId: string;
+  pairAddress: string;
+  labels?: string[];
+  priceUsd?: string;
+  liquidity?: { usd?: number };
 }
 
 /**
- * Текущий TVL (USD) одного DLMM-пула. Используется panic-detector'ом (фактор
- * F5 tvl_drop). Возвращает null при ошибке/отсутствии данных — вызывающий код
- * сам решает, как трактовать «неизвестно».
+ * Текущий TVL (USD) одного пула по адресу пары (DexScreener). Используется
+ * panic-detector'ом (фактор F5 tvl_drop). null при ошибке/отсутствии данных.
  */
 export async function fetchPoolTvl(poolAddress: string): Promise<number | null> {
   try {
-    const resp = await meteoraQ.get<{ liquidity?: string }>(`${METEORA_API}/pair/${poolAddress}`, {
-      timeout: 8000,
-    });
-    const tvl = parseFloat(resp.data?.liquidity ?? '');
-    return Number.isFinite(tvl) ? tvl : null;
+    const resp = await dexscreenerQ.get<{ pairs?: DexPair[]; pair?: DexPair }>(
+      `${DEXSCREENER_PAIR}/${poolAddress}`,
+      { timeout: 8000 }
+    );
+    const pair = resp.data?.pairs?.[0] ?? resp.data?.pair;
+    const tvl = pair?.liquidity?.usd;
+    return typeof tvl === 'number' ? tvl : null;
   } catch (err) {
     logger.warn(`fetchPoolTvl error for ${poolAddress}: ${err}`);
     return null;
