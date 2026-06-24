@@ -99,10 +99,7 @@ async function main(): Promise<void> {
     await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
 
     if (!secResult.passed) {
-      await tgBot.sendMessage(
-        `⚠️ Токен <b>${escHtml(token.symbol)}</b> не прошёл проверку безопасности.\n` +
-          `Чтобы всё равно отслеживать пул — ответьте: <code>/scan force:${escHtml(token.address)}</code>`
-      );
+      await tgBot.notifySecurityFailed(token, secResult);
       return;
     }
 
@@ -224,13 +221,7 @@ async function main(): Promise<void> {
     await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
 
     if (!secResult.passed) {
-      // Notify with force-enter button
-      await tgBot.sendMessage(
-        `⚠️ *${token.symbol}* не прошёл безопасность\\. Предупреждения:\n` +
-          secResult.warnings.map((w) => `• ${w}`).join('\n') +
-          `\n\nВсё равно отслеживать пул?`
-      );
-      // Inline button is handled via force_enter callback in bot
+      await tgBot.notifySecurityFailed(token, secResult);
       return;
     }
 

@@ -110,9 +110,8 @@ export class TelegramBot {
       `💧 Liquidity: $${fmt(token.liquidity)}`,
       '',
       `🧮 Security score: ${security.score}/100${security.hardFail ? ' — ❌ HARD-FAIL' : ''}`,
-      `🔐 GMGN fees: ${security.gmgnFeesSol.toFixed(1)} SOL`,
       `🛡 RugCheck: ${escHtml(security.rugcheckStatus)}`,
-      `👥 Топ холдеры: ${security.holderConcentration.toFixed(1)}%`,
+      `🫧 BubbleMaps децентрализация: ${security.decentralisationScore.toFixed(0)}/100`,
       `🐦 Twitter: ${security.twitterActive ? 'есть' : 'нет'}`,
     ];
 
@@ -135,6 +134,27 @@ export class TelegramBot {
     }
 
     await this.sendMessage(text.join('\n'));
+  }
+
+  /**
+   * Токен не прошёл security — сообщение с РАБОЧЕЙ кнопкой «всё равно отслеживать»
+   * (force_enter), а не текстовой инструкцией. Единый HTML-формат.
+   */
+  async notifySecurityFailed(token: TokenInfo, security: SecurityResult): Promise<void> {
+    const lines = [
+      `⚠️ <b>${escHtml(token.symbol)}</b> не прошёл проверку безопасности (score ${security.score}/100)`,
+      `CA: <code>${escHtml(token.address)}</code>`,
+      this.resourceLine(token.address, token.pairAddress),
+    ];
+    if (security.warnings.length > 0) {
+      lines.push('', '⚠️ <b>Причины:</b>');
+      security.warnings.forEach((w) => lines.push(`  • ${escHtml(w)}`));
+    }
+    lines.push('', 'Всё равно отслеживать пул?');
+    await this.sendMessageWithButtons(lines.join('\n'), [
+      [Markup.button.callback('⚠️ Всё равно отслеживать', `force_enter:${token.address}`)],
+      [Markup.button.callback('❌ Пропустить', `skip_pool:${token.address}`)],
+    ]);
   }
 
   /**

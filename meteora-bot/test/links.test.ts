@@ -10,6 +10,7 @@ describe('tokenLinks', () => {
     const links = tokenLinks(CA);
     expect(links.map((l) => l.label)).toEqual([
       'GMGN',
+      'Axiom',
       'BubbleMaps',
       'RugCheck',
       'DexScreener',

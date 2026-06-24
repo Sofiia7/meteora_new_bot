@@ -42,6 +42,7 @@ export function tokenLinks(ca: string, pairAddress?: string): ResourceLink[] {
 
   const candidates: Array<[string, string | null]> = [
     ['GMGN', fill(L.gmgn, { ca })],
+    ['Axiom', fill(L.axiom, { ca })],
     ['BubbleMaps', fill(L.bubblemaps, { ca })],
     ['RugCheck', fill(L.rugcheck, { ca })],
     ['DexScreener', fill(L.dexscreener, { pair: dexParam })],

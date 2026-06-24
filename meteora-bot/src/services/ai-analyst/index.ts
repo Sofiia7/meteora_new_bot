@@ -69,7 +69,7 @@ function buildUserPrompt(token: TokenInfo, s: SecurityResult): string {
     `Изменение цены 24h: ${token.priceChange24h.toFixed(1)}%`,
     `Security score: ${s.score}/100 (hardFail=${s.hardFail})`,
     `RugCheck: ${s.rugcheckStatus}`,
-    `Концентрация топ-холдеров: ${s.holderConcentration.toFixed(1)}%`,
+    `Децентрализация (BubbleMaps): ${s.decentralisationScore.toFixed(0)}/100`,
     `Mint authority активна: ${s.mintAuthorityActive}`,
     `Freeze authority активна: ${s.freezeAuthorityActive}`,
     `Honeypot: ${s.honeypot}`,

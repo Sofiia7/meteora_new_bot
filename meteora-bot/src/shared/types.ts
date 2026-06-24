@@ -23,7 +23,8 @@ export interface SecurityResult {
   hardFail: boolean;
   gmgnFeesSol: number;
   rugcheckStatus: string;
-  holderConcentration: number;
+  /** BubbleMaps decentralisation_score 0–100 (выше = лучше). 0 если источник недоступен. */
+  decentralisationScore: number;
   twitterActive: boolean;
   mintAuthorityActive: boolean;
   freezeAuthorityActive: boolean;

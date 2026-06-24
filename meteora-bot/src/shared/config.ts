@@ -154,6 +154,7 @@ export const config = {
     dexscreener: process.env['LINK_DEXSCREENER_TPL'] ?? 'https://dexscreener.com/solana/{pair}',
     solscan: process.env['LINK_SOLSCAN_TPL'] ?? 'https://solscan.io/token/{ca}',
     photon: process.env['LINK_PHOTON_TPL'] ?? 'https://photon-sol.tinyurl.com/en/lp/{pair}',
+    axiom: process.env['LINK_AXIOM_TPL'] ?? 'https://axiom.trade/t/{ca}',
     meteoraPool: process.env['LINK_METEORA_POOL_TPL'] ?? 'https://app.meteora.ag/dlmm/{pool}',
   },
   redis: {

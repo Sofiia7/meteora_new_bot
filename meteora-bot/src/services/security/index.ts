@@ -8,31 +8,39 @@ const RUGCHECK_API = 'https://api.rugcheck.xyz/v1';
 const GMGN_API = 'https://gmgn.ai/defi/router/v1/sol/token_info';
 const BUBBLEMAPS_API = 'https://api-legacy.bubblemaps.io/map-metadata';
 
-// ─── Веса скоринга (0–100). Hard-fail'ы (honeypot/authority/danger) перебивают скор. ──
+/**
+ * Веса скоринга (0–100). Откалибровано по живым ответам (Фаза 4, верифицировано):
+ *  - GMGN на VPS отдаёт 403 (Cloudflare) → за его недоступность НЕ штрафуем,
+ *    иначе любой токен валится не по своей вине.
+ *  - RugCheck — основной риск-источник. `score_normalised` это РИСК (0=безопасно,
+ *    100=максимальный риск), поэтому высокий = плохо.
+ *  - BubbleMaps `/map-metadata` отдаёт `decentralisation_score` (0–100, выше=лучше),
+ *    а НЕ список холдеров.
+ * Hard-fail (honeypot / mint|freeze authority) перебивает скор.
+ */
 const PENALTY = {
-  gmgnUnavailable: 20,
-  gmgnLowFees: 25,
-  rugcheckUnavailable: 40, // fail-closed: не смогли проверить риски → большой штраф
-  rugcheckWarn: 20,
-  rugcheckLowScore: 15,
-  bubblemapsUnavailable: 40, // fail-closed: не смогли проверить холдеров → большой штраф
-  highConcentration: 25,
-  noTwitter: 10, // мягкий минус (решение заказчика)
+  gmgnLowFees: 10,
+  noTwitter: 5,
+  rugcheckUnavailable: 30, // fail-closed: главный источник недоступен
+  rugcheckRiskHigh: 30, // risk >= 60
+  rugcheckRiskMed: 12, // risk 30..60
+  rugcheckDanger: 25, // есть risk level=danger (помимо authority/honeypot)
+  bubblemapsUnavailable: 15,
+  lowDecentralisationHard: 25, // decentralisation < 15
+  lowDecentralisationMed: 12, // decentralisation < 30
 };
 
 export interface GmgnData {
   available: boolean;
   totalFeesSol: number;
   hasTwitter: boolean;
-  honeypot: boolean;
-  mintAuthorityActive: boolean;
-  freezeAuthorityActive: boolean;
 }
 
 export interface RugcheckData {
   available: boolean;
-  scoreNormalised: number | null;
-  level: 'good' | 'warn' | 'danger' | 'unknown';
+  /** score_normalised: 0 = безопасно … 100 = максимальный риск. */
+  riskScore: number | null;
+  hasDanger: boolean;
   honeypot: boolean;
   mintAuthorityActive: boolean;
   freezeAuthorityActive: boolean;
@@ -40,14 +48,14 @@ export interface RugcheckData {
 
 export interface BubbleMapsData {
   available: boolean;
-  topHoldersPercent: number;
+  /** decentralisation_score 0–100, выше = лучше. */
+  decentralisationScore: number;
 }
 
 export class SecurityChecker {
   /**
    * Проверка безопасности токена. Score-based + fail-closed (Фаза 4).
-   * @param opts.bypassCache — для периодического re-check активных позиций (panic F4),
-   *        где нужен свежий ответ, а не закэшированный на входе.
+   * @param opts.bypassCache — для периодического re-check активных позиций (panic F4).
    */
   async check(tokenAddress: string, opts?: { bypassCache?: boolean }): Promise<SecurityResult> {
     const cacheKey = `security:${tokenAddress}`;
@@ -64,24 +72,17 @@ export class SecurityChecker {
       this.checkBubbleMaps(tokenAddress),
     ]);
 
-    const gmgnData = settled(gmgn, FALLBACK_GMGN);
-    const rugData = settled(rugcheck, FALLBACK_RUGCHECK);
-    const bmData = settled(bubbleMaps, FALLBACK_BUBBLEMAPS);
+    const result = evaluateSecurity(
+      settled(gmgn, FALLBACK_GMGN),
+      settled(rugcheck, FALLBACK_RUGCHECK),
+      settled(bubbleMaps, FALLBACK_BUBBLEMAPS)
+    );
 
-    const result = evaluateSecurity(gmgnData, rugData, bmData);
-
-    // Кэшируем и свежие проверки тоже (10 минут) — следующий re-check возьмёт из кэша
-    // только если bypassCache не выставлен.
     await cacheSet(cacheKey, JSON.stringify(result), 600);
     return result;
   }
 
-  // ─── Источники ───────────────────────────────────────────────────────────────
-  //
-  // ВНИМАНИЕ: точные имена полей в ответах GMGN/RugCheck/BubbleMaps НЕ верифицированы
-  // против живого API (нужен прогон с ключами на реальном токене — открытый пункт
-  // Фазы 4). Парсинг намеренно защитный: неизвестное поле ⇒ false/недоступно, а не
-  // ложный «всё ок». Authority/honeypot основной источник — RugCheck risks.
+  // ─── Источники (верифицировано против живых ответов) ──────────────────────────
 
   private async checkGmgn(tokenAddress: string): Promise<GmgnData> {
     try {
@@ -91,13 +92,10 @@ export class SecurityChecker {
         available: true,
         totalFeesSol: parseFloat(d.total_fees_sol ?? d.fee_sol ?? '0') || 0,
         hasTwitter: !!(d.twitter || d.social?.twitter || d.twitter_username),
-        honeypot: truthy(d.is_honeypot ?? d.honeypot),
-        // GMGN отдаёт «renounced_*» (true = authority отозвана). Активна = !renounced.
-        mintAuthorityActive: authorityActive(d.mint_authority, d.renounced_mint),
-        freezeAuthorityActive: authorityActive(d.freeze_authority, d.renounced_freeze_account),
       };
     } catch (err) {
-      logger.warn(`GMGN check failed for ${tokenAddress}: ${err}`);
+      // На VPS обычно 403 Cloudflare — это ожидаемо, не вина токена.
+      logger.warn(`GMGN unavailable for ${tokenAddress}: ${err}`);
       return { ...FALLBACK_GMGN };
     }
   }
@@ -112,17 +110,12 @@ export class SecurityChecker {
       const risks: Array<{ name?: string; level?: string }> = Array.isArray(data.risks)
         ? data.risks
         : [];
-      const riskNames = risks.map((r) => (r.name ?? '').toLowerCase());
-      const has = (kw: string): boolean => riskNames.some((n) => n.includes(kw));
-      const scoreNormalised =
-        typeof data.score_normalised === 'number' ? data.score_normalised : null;
-      const danger = risks.some((r) => (r.level ?? '').toLowerCase() === 'danger');
-      const warn = risks.some((r) => (r.level ?? '').toLowerCase() === 'warn');
-
+      const names = risks.map((r) => (r.name ?? '').toLowerCase());
+      const has = (kw: string): boolean => names.some((n) => n.includes(kw));
       return {
         available: true,
-        scoreNormalised,
-        level: danger ? 'danger' : warn ? 'warn' : 'good',
+        riskScore: typeof data.score_normalised === 'number' ? data.score_normalised : null,
+        hasDanger: risks.some((r) => (r.level ?? '').toLowerCase() === 'danger'),
         honeypot: has('honeypot'),
         mintAuthorityActive: has('mint authority'),
         freezeAuthorityActive: has('freeze authority'),
@@ -139,15 +132,11 @@ export class SecurityChecker {
         `${BUBBLEMAPS_API}?token=${tokenAddress}&chain=sol`,
         { timeout: 8000 }
       );
-      const holders: Array<{ percentage: number }> = resp.data?.nodes ?? [];
-      // Если узлов нет — данные неполные, это НЕ «0% концентрация = отлично».
-      if (holders.length === 0) return { ...FALLBACK_BUBBLEMAPS };
-      const top10 = holders
-        .slice()
-        .sort((a, b) => b.percentage - a.percentage)
-        .slice(0, 10)
-        .reduce((sum, h) => sum + h.percentage, 0);
-      return { available: true, topHoldersPercent: top10 };
+      const d = resp.data ?? {};
+      // Реальный ответ: { status:"OK", decentralisation_score:42.6, identified_supply:{...} }.
+      if ((d.status ?? '').toString().toUpperCase() !== 'OK') return { ...FALLBACK_BUBBLEMAPS };
+      const ds = typeof d.decentralisation_score === 'number' ? d.decentralisation_score : 0;
+      return { available: true, decentralisationScore: ds };
     } catch (err) {
       logger.warn(`BubbleMaps failed for ${tokenAddress}: ${err}`);
       return { ...FALLBACK_BUBBLEMAPS };
@@ -156,8 +145,8 @@ export class SecurityChecker {
 }
 
 /**
- * Чистая (без I/O) функция скоринга — выделена ради тестируемости и чтобы отделить
- * сетевые источники от логики решения. Решение: passed = !hardFail && score>=min.
+ * Чистая функция скоринга (без I/O) — выделена ради тестируемости.
+ * passed = !hardFail && score >= MIN_SECURITY_SCORE.
  */
 export function evaluateSecurity(
   gmgn: GmgnData,
@@ -169,19 +158,25 @@ export function evaluateSecurity(
   const warnings: string[] = [];
   const sourcesUnavailable: string[] = [];
 
-  // ── GMGN: fees + доступность ──────────────────────────────────────────────
+  // ── GMGN: fees + twitter. Недоступность НЕ штрафуем (Cloudflare на VPS). ──────
+  let twitterActive = false;
   if (!gmgn.available) {
     sourcesUnavailable.push('GMGN');
-    score -= PENALTY.gmgnUnavailable;
-    warnings.push('GMGN недоступен');
-  } else if (gmgn.totalFeesSol < config.security.minGmgnFeesSol) {
-    score -= PENALTY.gmgnLowFees;
-    warnings.push(
-      `GMGN fees низкие: ${gmgn.totalFeesSol.toFixed(1)} SOL (мин ${config.security.minGmgnFeesSol})`
-    );
+  } else {
+    twitterActive = gmgn.hasTwitter;
+    if (gmgn.totalFeesSol < config.security.minGmgnFeesSol) {
+      score -= PENALTY.gmgnLowFees;
+      warnings.push(
+        `GMGN fees низкие: ${gmgn.totalFeesSol.toFixed(1)} SOL (мин ${config.security.minGmgnFeesSol})`
+      );
+    }
+    if (!twitterActive) {
+      score -= PENALTY.noTwitter;
+      warnings.push('Нет Twitter/соц-активности');
+    }
   }
 
-  // ── RugCheck: уровень риска + нормализованный скор ─────────────────────────
+  // ── RugCheck: риск-скор + danger-уровень ──────────────────────────────────────
   let rugStatus: string;
   if (!rug.available) {
     sourcesUnavailable.push('RugCheck');
@@ -189,27 +184,31 @@ export function evaluateSecurity(
     warnings.push('RugCheck недоступен (fail-closed)');
     rugStatus = 'unavailable';
   } else {
-    if (rug.level === 'danger') {
-      hardFail = true;
-      warnings.push('RugCheck: DANGER');
-      rugStatus = 'Danger';
-    } else if (rug.level === 'warn') {
-      score -= PENALTY.rugcheckWarn;
-      warnings.push('RugCheck: warn');
-      rugStatus = 'Warn';
+    const risk = rug.riskScore;
+    if (risk === null) {
+      rugStatus = 'Unknown';
+    } else if (risk >= 60) {
+      score -= PENALTY.rugcheckRiskHigh;
+      warnings.push(`RugCheck риск ${risk}/100`);
+      rugStatus = 'High risk';
+    } else if (risk >= 30) {
+      score -= PENALTY.rugcheckRiskMed;
+      warnings.push(`RugCheck риск ${risk}/100`);
+      rugStatus = 'Medium';
     } else {
-      rugStatus = rug.scoreNormalised !== null && rug.scoreNormalised >= 80 ? 'Good' : 'Unknown';
+      rugStatus = 'Good';
     }
-    if (rug.scoreNormalised !== null && rug.scoreNormalised < 50) {
-      score -= PENALTY.rugcheckLowScore;
-      warnings.push(`RugCheck score ${rug.scoreNormalised}/100`);
+    if (rug.hasDanger) {
+      score -= PENALTY.rugcheckDanger;
+      warnings.push('RugCheck: есть danger-риски');
+      if (rugStatus === 'Good' || rugStatus === 'Unknown') rugStatus = 'Danger';
     }
   }
 
-  // ── Honeypot / authorities — жёсткие провалы (любой источник) ──────────────
-  const honeypot = gmgn.honeypot || rug.honeypot;
-  const mintAuthorityActive = gmgn.mintAuthorityActive || rug.mintAuthorityActive;
-  const freezeAuthorityActive = gmgn.freezeAuthorityActive || rug.freezeAuthorityActive;
+  // ── Honeypot / authorities — жёсткие провалы (источник — RugCheck) ────────────
+  const honeypot = rug.honeypot;
+  const mintAuthorityActive = rug.mintAuthorityActive;
+  const freezeAuthorityActive = rug.freezeAuthorityActive;
   if (honeypot) {
     hardFail = true;
     warnings.push('🍯 Honeypot detected');
@@ -223,29 +222,25 @@ export function evaluateSecurity(
     warnings.push('Freeze authority активна (можно заморозить кошельки)');
   }
 
-  // ── BubbleMaps: концентрация холдеров (fail-closed) ────────────────────────
-  let holderConcentration: number;
+  // ── BubbleMaps: децентрализация (fail-closed при недоступности) ───────────────
+  let decentralisationScore: number;
   if (!bm.available) {
     sourcesUnavailable.push('BubbleMaps');
     score -= PENALTY.bubblemapsUnavailable;
     warnings.push('BubbleMaps недоступен (fail-closed)');
-    holderConcentration = 100; // неизвестно ⇒ считаем худшим, не «0% = отлично»
+    decentralisationScore = 0;
   } else {
-    holderConcentration = bm.topHoldersPercent;
-    if (holderConcentration > config.security.maxHolderConcentrationPct) {
-      score -= PENALTY.highConcentration;
-      warnings.push(`Высокая концентрация холдеров: ${holderConcentration.toFixed(1)}%`);
+    decentralisationScore = bm.decentralisationScore;
+    if (decentralisationScore < 15) {
+      score -= PENALTY.lowDecentralisationHard;
+      warnings.push(`Низкая децентрализация: ${decentralisationScore.toFixed(0)}/100`);
+    } else if (decentralisationScore < 30) {
+      score -= PENALTY.lowDecentralisationMed;
+      warnings.push(`Умеренная децентрализация: ${decentralisationScore.toFixed(0)}/100`);
     }
   }
 
-  // ── Twitter — мягкий минус ────────────────────────────────────────────────
-  const twitterActive = gmgn.hasTwitter;
-  if (!twitterActive) {
-    score -= PENALTY.noTwitter;
-    warnings.push('Нет Twitter/соц-активности');
-  }
-
-  score = Math.max(0, Math.min(100, score));
+  score = Math.max(0, Math.min(100, Math.round(score)));
   const passed = !hardFail && score >= config.security.minScore;
 
   return {
@@ -254,7 +249,7 @@ export function evaluateSecurity(
     hardFail,
     gmgnFeesSol: gmgn.totalFeesSol,
     rugcheckStatus: rugStatus,
-    holderConcentration,
+    decentralisationScore,
     twitterActive,
     mintAuthorityActive,
     freezeAuthorityActive,
@@ -266,41 +261,17 @@ export function evaluateSecurity(
 
 // ─── Helpers / fallbacks ────────────────────────────────────────────────────────
 
-const FALLBACK_GMGN: GmgnData = {
-  available: false,
-  totalFeesSol: 0,
-  hasTwitter: false,
-  honeypot: false,
-  mintAuthorityActive: false,
-  freezeAuthorityActive: false,
-};
+const FALLBACK_GMGN: GmgnData = { available: false, totalFeesSol: 0, hasTwitter: false };
 const FALLBACK_RUGCHECK: RugcheckData = {
   available: false,
-  scoreNormalised: null,
-  level: 'unknown',
+  riskScore: null,
+  hasDanger: false,
   honeypot: false,
   mintAuthorityActive: false,
   freezeAuthorityActive: false,
 };
-const FALLBACK_BUBBLEMAPS: BubbleMapsData = { available: false, topHoldersPercent: 100 };
+const FALLBACK_BUBBLEMAPS: BubbleMapsData = { available: false, decentralisationScore: 0 };
 
 function settled<T>(r: PromiseSettledResult<T>, fallback: T): T {
   return r.status === 'fulfilled' ? r.value : fallback;
-}
-
-function truthy(v: unknown): boolean {
-  return v === true || v === 1 || v === '1' || v === 'true';
-}
-
-/**
- * Активна ли authority. Источники описывают её по-разному:
- *  - явный адрес authority (непусто ⇒ активна),
- *  - флаг renounced (true ⇒ отозвана ⇒ НЕ активна).
- * Неизвестно ⇒ false (защитно: не плодим ложные hard-fail; реальный руг ловит RugCheck).
- */
-function authorityActive(authorityField: unknown, renouncedField: unknown): boolean {
-  if (typeof renouncedField === 'boolean') return !renouncedField;
-  if (typeof authorityField === 'string') return authorityField.length > 0;
-  if (authorityField === null) return false;
-  return false;
 }
