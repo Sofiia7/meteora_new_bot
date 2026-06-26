@@ -1,180 +1,189 @@
-# Meteora LP-Farm Bot — AI-ко-пилот, а не автопилот
+# Meteora LP-Farm Bot — an AI co-pilot, not an autopilot
 
 [![CI](https://github.com/Sofiia7/meteora_new_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/Sofiia7/meteora_new_bot/actions/workflows/ci.yml)
 
-> Полуавтоматический помощник для **LP-фарма на мемкоин-пулах Meteora DLMM** (Solana).
-> Бот берёт на себя рутину и исполнение — сканит, проверяет на скам, считает комиссии,
-> ведёт позицию, — но **решение войти и момент выхода остаются за человеком**.
-> Ко-пилот соединяет машинную рутину с человеческим суждением (и опциональным AI-вторым мнением).
+> A semi-automatic assistant for **LP farming on Meteora DLMM memecoin pools** (Solana).
+> The bot takes the grind and execution off your hands — it scans, screens for scams,
+> tracks fees, manages the position — but **the decision to enter and the moment to exit
+> stay with you**. A co-pilot that pairs machine routine with human judgment (and an
+> optional AI second opinion).
 
-## 💡 Киллер-фича
+## 💡 Killer feature
 
-Не «ещё один торговый бот с авто-стоп-лоссом». Две вещи отличают его:
+Not "yet another trading bot with an auto stop-loss". Two things set it apart:
 
-1. **Human-in-the-loop по дизайну.** Бот никогда не входит и не выбирает пул сам — он
-   присылает в Telegram **все DLMM-пулы по токену** (со всеми fee-%, со ссылками на GMGN /
-   BubbleMaps / RugCheck / DexScreener / Solscan / Photon / Meteora), а ты жмёшь кнопку.
-   Оператор полностью ведёт процесс.
-2. **Композитный panic-детектор вместо тупого стоп-лосса.** Авто-выход срабатывает **не**
-   по одному порогу (это даёт ложные выбивания на волатильности мемов), а только когда
-   одновременно сходится **картина пиздеца** — ≥ N независимых негативных факторов: слив
-   объёма + RSI + просадка от ATH + ухудшение security (отложенный руг) + слив TVL пула.
+1. **Human-in-the-loop by design.** The bot never enters or picks a pool on its own — it
+   sends **all of a token's Meteora pools** to Telegram (with links to GMGN / Axiom /
+   BubbleMaps / RugCheck / DexScreener / Solscan / Photon and a Meteora link per pool), and
+   you press a button. The operator fully drives the process.
+2. **A composite "panic detector" instead of a dumb stop-loss.** An auto-exit fires **not**
+   on a single threshold (that produces false exits on memecoin volatility), but only when
+   several independent negative factors line up at once — a **full picture of a rug**: volume
+   crash + RSI + drawdown from ATH + security degradation (delayed rug) + pool TVL drain.
 
-## 😖 Какую боль решает
+## 😖 The pain it solves
 
-На комиссиях LP в мемкоин-пулах Meteora можно зарабатывать, но руками это ад: искать
-свежие пулы, проверять токен на скам по пяти сервисам, ловить момент выхода. А полный
-автопилот страшно оставить без присмотра — он не видит фада в твиттере и сливает на руге,
-который индикаторы не ловят. Бот забирает рутину и исполнение, человек держит суждение и
-палец на выходе.
+You can earn on LP fees in Meteora memecoin pools, but doing it by hand is hell: finding
+fresh pools, screening tokens for scams across five services, catching the exit. And a full
+autopilot is scary to leave unattended — it doesn't see the FUD on Twitter and dumps into a
+rug the indicators miss. The bot takes the routine and execution; the human keeps the
+judgment and a finger on the exit.
 
-## 🔄 Поток работы
+## 🔄 Workflow
 
 ```
-Scanner (DexScreener, каждые 5 мин)
-   → Chart-health score (ATH-distance, объём, ликвидность, дамп)
+Scanner (DexScreener, every 5 min)
+   → Chart-health score (ATH distance, volume, liquidity, dump)
    → Security score 0–100 (GMGN + RugCheck + BubbleMaps, fail-closed)
-   → [опц.] AI-аналитик (локальная LLM даёт вердикт словами)
-   → 📲 Telegram-алерт с метриками и ССЫЛКАМИ
-        → ты жмёшь [✅ Войти в пул X] / [⏳ Ждать] / [❌ Пропустить]
-   → LP Manager открывает позицию (Meteora DLMM, single-sided SOL)
-   → Exit Strategy + Panic Detector ведут позицию
-   → выход: 🔴 ручная кнопка в любой момент
-            ИЛИ авто-тейкпрофит (fee-target / новый ATH / Bollinger)
-            ИЛИ 🚨 композитная паника (≥N факторов одновременно)
+   → [optional] AI analyst (a local LLM gives a plain-language verdict)
+   → 📲 Telegram alert with metrics and LINKS
+        → you press [✅ Enter pool X] / [⏳ Wait] / [❌ Skip]
+   → LP Manager opens the position (Meteora DLMM, single-sided SOL)
+   → Exit Strategy + Panic Detector manage the position
+   → exit: 🔴 manual button at any time
+           OR auto take-profit (fee target / new ATH / Bollinger)
+           OR 🚨 composite panic (≥N factors at once)
 ```
 
-## 🏗 Архитектура
+## 🏗 Architecture
 
-Изолированные сервисы, каждый с одной задачей; общаются через колбэки; состояние — в SQLite.
+Isolated services, each with one job; they talk via callbacks; state lives in SQLite.
 
 ```
-            ┌─────────────┐   новые токены    ┌──────────────────┐
+            ┌─────────────┐   new tokens      ┌──────────────────┐
             │  Scanner    │ ───────────────▶  │  Chart-Health    │
             │ DexScreener │                   │  (score 0–100)   │
             └─────────────┘                   └────────┬─────────┘
-                                                       │ прошёл
+                                                       │ passed
                                               ┌────────▼─────────┐
                                               │  Security        │  GMGN
                                               │  score+fail-closed│─ RugCheck
-                                              │  (+ AI-аналитик) │  BubbleMaps
+                                              │  (+ AI analyst)  │  BubbleMaps
                                               └────────┬─────────┘
-                                                       │ алерт
-   ┌──────────────┐   все DLMM-пулы          ┌─────────▼─────────┐
-   │ Pool Watcher │ ◀────────────────────────│   Telegram Bot    │◀── ты (кнопки)
-   │  Meteora API │ ─── выбор человека ──────▶│  allowlist + HTML │
+                                                       │ alert
+   ┌──────────────┐   all Meteora pools      ┌─────────▼─────────┐
+   │ Pool Watcher │ ◀────────────────────────│   Telegram Bot    │◀── you (buttons)
+   │ DexScreener  │ ─── human's choice ──────▶│  allowlist + HTML │
    └──────┬───────┘                          └─────────┬─────────┘
-          │ вход                                       │
-   ┌──────▼───────┐   мониторинг        ┌──────────────▼──────────────┐
+          │ enter                                      │
+   ┌──────▼───────┐   monitoring        ┌──────────────▼──────────────┐
    │  LP Manager  │ ◀───────────────────│ Exit Strategy + Panic Detector│
-   │ Meteora DLMM │ ─── закрытие ───────▶│ тейкпрофиты / композит-паника │
+   │ Meteora DLMM │ ─── close ──────────▶│ take-profits / composite panic│
    └──────────────┘                     └───────────────────────────────┘
 
-   Сквозные: HttpQueue (throttle+backoff на источник) · SQLite (позиции, watched,
-   price_history, token_ath) · ATH-watcher (re-notify по новому хаю +X%) · recovery после рестарта.
+   Cross-cutting: HttpQueue (per-source throttle + backoff) · SQLite (positions, watched,
+   price_history, token_ath) · ATH watcher (re-notify on a new high +X%) · restart recovery.
 ```
 
-## ✨ Возможности
+## ✨ Features
 
-- **Вход только по кнопке** — ты видишь метрики и ссылки до решения, бот не входит сам.
-- **Все DLMM-пулы по токену** со всеми fee-%, ⭐ помечает совпавший со стратегией; вход в любой.
-- **Security-движок 0–100**: score-based решение (не «нет варнингов = ок»), **fail-closed**
-  (недоступный источник штрафует, а не пропускает), явные проверки honeypot / mint / freeze
-  authority, Twitter — мягкий минус.
-- **Композитный panic-детектор**: авто-выход только при ≥N факторов одновременно в окне.
-- **Авто-тейкпрофиты**: цель по комиссиям, новый ATH, пробой Bollinger.
-- **Деградация графика** (RSI+объём) → предупреждение с кнопкой, **без** авто-выхода.
-- **Ручной выход** 🔴 прямо на сообщении позиции — главный инструмент паники.
-- **Re-notification по новому ATH** (+X% над прошлым уведомлением, анти-спам, полный перепрогон).
-- **Ватчлист**: `/watchlist`, ручное добавление/удаление; нет пулов 2 ч → таймаут + наблюдение.
-- **State recovery**: позиции и наблюдения переживают рестарт.
-- **Кликабельные ссылки** на ресурсы во всех уведомлениях.
+- **Entry by button only** — you see metrics and links before deciding; the bot never enters
+  on its own.
+- **All Meteora pools for a token** (DLMM + DAMM V2), each labeled by type, with TVL and a
+  Meteora link; enter any of them. ⭐ marks the pool matching your strategy when the fee tier
+  is known.
+- **Security engine 0–100**: score-based decision (not "no warnings = fine"), **fail-closed**
+  (an unreachable source penalizes rather than passes), explicit honeypot / mint / freeze
+  authority checks; Twitter is a soft minus.
+- **Composite panic detector**: auto-exit only when ≥N factors line up at once in a window.
+- **Auto take-profits**: fee target, new ATH, Bollinger breakout.
+- **Chart degradation** (RSI + volume) → a warning with a button, **no** auto-exit.
+- **Manual exit** 🔴 right on the position message — the operator's main panic tool.
+- **Re-notification on a new ATH** (+X% over the last notification, anti-spam, full re-run).
+- **Watchlist**: `/watchlist`, manual add/remove; if no pool in 2 h → timeout + keep-watching.
+- **Restart recovery**: positions and watches survive a restart.
+- **Clickable resource links** in every notification.
 
-## 🤖 AI-слой (опционально, локальная LLM)
+## 🤖 AI layer (optional, local LLM)
 
-`AI_ENABLED=true` подключает **локальную** LLM (OpenAI-совместимый эндпоинт — Ollama /
-LM Studio / vLLM) как «второе мнение»: она получает метрики токена + результаты security и
-возвращает короткий вердикт человеческим языком и уровень риска (🟢/🟡/🔴) прямо в алерт.
-Никаких облачных вызовов — всё крутится у тебя. По умолчанию выключено: бот полностью
-работает и без LLM.
+`AI_ENABLED=true` connects a **local** LLM (OpenAI-compatible endpoint — Ollama / LM Studio /
+vLLM) as a "second opinion": it receives the token metrics + security results and returns a
+short plain-language verdict and a risk level (🟢/🟡/🔴) right in the alert. No cloud calls —
+everything runs on your side. Disabled by default: the bot works fully without an LLM.
 
 ## 🛡 Safety gate
 
-- `DRY_RUN=true` (по умолчанию) — бот делает всё, кроме реальных транзакций. Безопасно
-  смотреть, как он сканит и шлёт алерты.
-- **Реальная торговля** требует **обоих** флагов: `DRY_RUN=false` И `ENABLE_MAINNET_TRADING=true`.
-- **Telegram allowlist** — управлять ботом (тратить кошелёк) может только chat_id из
-  `TELEGRAM_ALLOWED_CHAT_IDS`; всё остальное middleware режет до обработчика.
-- Валидация приватника на старте (base58, 64 байта) и проверка баланса перед входом.
+- `DRY_RUN=true` (default) — the bot does everything except real transactions. Safe to watch
+  it scan and send alerts.
+- **Real trading** requires **both** flags: `DRY_RUN=false` AND `ENABLE_MAINNET_TRADING=true`.
+- **Telegram allowlist** — only a chat_id in `TELEGRAM_ALLOWED_CHAT_IDS` can control the bot
+  (spend the wallet); everything else is cut by middleware before the handler.
+- Private-key validation at startup (base58, 64 bytes) and a balance check before entry.
 
-## 💬 Команды Telegram
+## 💬 Telegram commands
 
-`/start` · `/status` — статус · `/positions` — позиции с кнопкой закрытия ·
-`/watchlist` — наблюдаемые токены (+ убрать) · `/watch <CA>` — добавить в наблюдение ·
-`/scan <CA>` — проверить токен вручную
+`/start` · `/status` — status · `/positions` — positions with a close button ·
+`/watchlist` — watched tokens (+ remove) · `/watch <CA>` — add to watch ·
+`/scan <CA>` — check a token manually
 
-## 🚀 Запустить за 2 минуты (DRY_RUN, без риска)
+## 🚀 Run it in 2 minutes (DRY_RUN, no risk)
 
 ```bash
 cd meteora-bot
 npm install
 cp .env.example .env
-#  заполни 3 поля: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RPC_URL
-#  (SOLANA_PRIVATE_KEY нужен валидный base58, но в DRY_RUN деньги не тратятся)
+#  fill 3 fields: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RPC_URL
+#  (SOLANA_PRIVATE_KEY must be valid base58, but in DRY_RUN no money is spent)
 npm run dev
 ```
 
-Бот стартует в `DRY_RUN`, печатает баннер с режимом и кошельком и начинает слать алерты по
-новым токенам в твой Telegram. Никаких транзакций — можно спокойно смотреть весь флоу.
+The bot starts in `DRY_RUN`, prints a banner with the mode and wallet, and starts sending
+alerts for new tokens to your Telegram. No transactions — you can watch the whole flow safely.
 
-## ⚙️ Включить мейннет
+> Note: use **Node 20** (LTS). better-sqlite3 ships prebuilt binaries for it; on newer Node
+> (24) you may need `npm rebuild better-sqlite3`. CI runs on Node 20.
 
-Никакого devnet: мемкоин-пулов Meteora на devnet нет, тестировать там нечего. Боевой режим —
-просто два флага в `.env`:
+## ⚙️ Enable mainnet
+
+No devnet: Meteora memecoin pools don't exist on devnet, so there's nothing to test there.
+Live mode is just two flags in `.env`:
 
 ```bash
 DRY_RUN=false
 ENABLE_MAINNET_TRADING=true
 ```
 
-Бот уже работал на мейннете с реальными деньгами. Начинай с маленького `LP_AMOUNT_SOL`.
+The bot has already run on mainnet with real money. Start with a small `LP_AMOUNT_SOL`.
 
-## ✅ Качество кода
+## ✅ Code quality
 
 ```bash
-npm run typecheck   # tsc --noEmit — 0 ошибок
-npm run lint        # eslint (flat config, ESLint 9) — 0 предупреждений
-npm test            # vitest — юнит-тесты логики (security-скоринг, ссылки)
+npm run typecheck   # tsc --noEmit — 0 errors
+npm run lint        # eslint (flat config, ESLint 9) — 0 warnings
+npm test            # vitest — unit tests for the logic (security scoring, links, signals, mapper)
 ```
 
-## 📌 Честный статус
+## 📌 Honest status
 
-- ✅ Работает: сканер, chart-health, pool-watcher, LP open/close, exit-стратегии,
-  композит-паника, Telegram-UX, recovery, ватчлист, ссылки. Прогонялся на мейннете.
-- ⚠️ Требует live-верификации: **парсинг ответов GMGN/RugCheck/BubbleMaps**. Логика
-  security защитная и fail-closed, но точные имена полей — предположения; перед серьёзным
-  мейннетом нужно сверить их с реальными ответами API на нескольких токенах.
-- 🔜 Roadmap (см. [PLAN.md](../PLAN.md)): 15м-OHLCV-провайдер для честного RSI, расширение
-  тестов, CI.
+- ✅ Working: scanner, chart-health, pool watcher, LP open/close, exit strategies, composite
+  panic, Telegram UX, recovery, watchlist, links. Has run on mainnet.
+- ⚠️ External-API notes (verified live from the VPS): **Meteora's `dlmm-api` returns 404** on
+  every endpoint, so pool discovery runs through **DexScreener** (it doesn't expose the fee
+  tier / bin step, so pools show as "DLMM / DAMM V2" without the tier). **GMGN returns 403**
+  (Cloudflare blocks the VPS IP) — its unavailability no longer penalizes a token. RugCheck +
+  BubbleMaps parsing is verified against live responses.
+- 🔜 Roadmap (see [PLAN.md](PLAN.md)): GeckoTerminal for socials + real OHLCV (true ATH/RSI),
+  fee-tier enrichment via the on-chain DLMM SDK, broader tests, CI.
 
-## 🧰 Стек
+## 🧰 Stack
 
 TypeScript · `@meteora-ag/dlmm` · `@solana/web3.js` · Anchor · better-sqlite3 · Telegraf ·
 technicalindicators · axios · vitest · ESLint 9
 
-## ⚠️ Дисклеймер
+## ⚠️ Disclaimer
 
-- **Никогда не коммить `.env` и `SOLANA_PRIVATE_KEY`** в публичный репозиторий.
-- Держи на торговом кошельке только тот бюджет, который готов потерять.
-- Это не финансовый совет. Мемкоины крайне волатильны и часто оказываются скамом.
+- **Never commit `.env` or `SOLANA_PRIVATE_KEY`** to a public repository.
+- Keep only the budget you can afford to lose on the trading wallet.
+- This is not financial advice. Memecoins are extremely volatile and are often scams.
 
-## 👤 О проекте
+## 👤 About
 
-Вайбкодинг-проект: код написан в паре с AI-ассистентом (Claude Code). **Личный вклад** —
-продуктовая стратегия и риск-архитектура: human-in-the-loop вместо автопилота, отказ от
-жёсткого стоп-лосса в пользу композитного детектора, философия «бот предлагает — человек
-решает», пороги и риск-рамки. **AI** генерировал реализацию по этим решениям. Подавался на
-вайбкодинг-конкурс ЛАЙФЧЕЙНДЖ.
+A vibecoding project: the code was written with an AI assistant (Claude Code). **The personal
+contribution** is the product strategy and risk architecture: human-in-the-loop instead of an
+autopilot, dropping the hard stop-loss in favor of a composite detector, the "the bot
+proposes — the human decides" philosophy, the thresholds and risk framing. **The AI**
+generated the implementation from those decisions. Submitted to the LIFECHANGE vibecoding
+contest.
 
-> Парный проект — [meteora_early_mem](https://github.com/Sofiia7/meteora_early_mem):
-> быстрый снайпер ранних пулов. Этот бот — спокойный фильтрованный фарм.
+> Sister project — [meteora_early_mem](https://github.com/Sofiia7/meteora_early_mem):
+> a fast early-pool sniper. This bot is the calm, filtered farm.
