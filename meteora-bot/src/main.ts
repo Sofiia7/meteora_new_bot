@@ -157,6 +157,11 @@ async function main(): Promise<void> {
     await tgBot.notifyPoolTimeout(tokenAddress, tokenSymbol);
   });
 
+  // Первая проверка не нашла пулов — сообщаем, что встали в наблюдение.
+  poolWatcher.onNoPools(async (tokenAddress, tokenSymbol) => {
+    await tgBot.notifyNoPoolsYet(tokenAddress, tokenSymbol);
+  });
+
   // ─── Ватчлист: «не входить» / убрать вручную / добавить вручную ───────────
   //
   // stopWatching живёт на poolWatcher (этот скоуп), поэтому отмену делаем здесь,

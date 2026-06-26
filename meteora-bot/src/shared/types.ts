@@ -43,6 +43,8 @@ export interface AiVerdict {
 export interface PoolInfo {
   address: string;
   tokenMint: string;
+  /** Тип пула Meteora: 'DLMM' | 'DAMM V2' | 'DAMM' | 'Meteora'. */
+  poolType: string;
   feeBps: number;
   binStep: number;
   tvl: number;

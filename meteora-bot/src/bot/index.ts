@@ -175,7 +175,7 @@ export class TelegramBot {
       p.feeBps === config.poolWatcher.targetFeeBps && preferred.has(p.binStep);
 
     const lines: string[] = [
-      `🪙 <b>${escHtml(token.symbol)}</b> — найдены DLMM-пулы`,
+      `🪙 <b>${escHtml(token.symbol)}</b> — найдены пулы Meteora`,
       `CA: <code>${escHtml(token.address)}</code>`,
       this.resourceLine(token.address, token.pairAddress),
       '',
@@ -186,12 +186,10 @@ export class TelegramBot {
       const star = isStrategy(p) ? '⭐' : '▫️';
       const mUrl = meteoraPoolUrl(p.address);
       const meteora = mUrl ? ` · <a href="${escAttr(mUrl)}">Meteora↗</a>` : '';
-      // feeBps/binStep могут быть неизвестны (DexScreener их не отдаёт) — тогда «DLMM».
-      const spec =
-        p.feeBps > 0
-          ? `${(p.feeBps / 100).toFixed(2)}%${p.binStep > 0 ? ` · step${p.binStep}` : ''}`
-          : 'DLMM';
-      lines.push(`${star} ${i + 1}) ${spec} · TVL $${fmtShort(p.tvl)}${meteora}`);
+      // feeBps/binStep часто неизвестны (DexScreener их не отдаёт) — показываем тип пула.
+      const fee = p.feeBps > 0 ? ` · ${(p.feeBps / 100).toFixed(2)}%` : '';
+      const step = p.binStep > 0 ? ` · step${p.binStep}` : '';
+      lines.push(`${star} ${i + 1}) ${p.poolType}${fee}${step} · TVL $${fmtShort(p.tvl)}${meteora}`);
     });
     if (pools.length > shown.length) {
       lines.push('', `…и ещё ${pools.length - shown.length} пул(ов)`);
@@ -199,10 +197,8 @@ export class TelegramBot {
     if (anyStrategy) lines.push('', '⭐ = совпадает со стратегией (5% + binStep 80/100/125)');
 
     const buttons = shown.map((p, i) => {
-      const label =
-        p.feeBps > 0
-          ? `✅ ${i + 1}) ${(p.feeBps / 100).toFixed(2)}%${p.binStep > 0 ? ` / step${p.binStep}` : ''}`
-          : `✅ Войти в пул ${i + 1} (TVL $${fmtShort(p.tvl)})`;
+      const fee = p.feeBps > 0 ? ` ${(p.feeBps / 100).toFixed(2)}%` : '';
+      const label = `✅ Войти ${i + 1} (${p.poolType}${fee}, $${fmtShort(p.tvl)})`;
       return [Markup.button.callback(label, `enter_pool:${token.address}:${i}`)];
     });
     buttons.push([
@@ -211,6 +207,20 @@ export class TelegramBot {
     ]);
 
     await this.sendMessageWithButtons(lines.join('\n'), buttons);
+  }
+
+  /** Пулов пока нет — явно сообщаем, что наблюдаем (чтобы не было «непонятно что происходит»). */
+  async notifyNoPoolsYet(tokenAddress: string, tokenSymbol: string): Promise<void> {
+    const text = [
+      `🔭 <b>${escHtml(tokenSymbol)}</b>: пулов Meteora пока нет`,
+      `CA: <code>${escHtml(tokenAddress)}</code>`,
+      this.resourceLine(tokenAddress),
+      '',
+      `Наблюдаю — проверяю каждые 30с (таймаут 2ч). Пришлю, как только появятся.`,
+    ].join('\n');
+    await this.sendMessageWithButtons(text, [
+      [Markup.button.callback('❌ Прекратить наблюдение', `skip_pool:${tokenAddress}`)],
+    ]);
   }
 
   async notifyPoolTimeout(tokenAddress: string, tokenSymbol: string): Promise<void> {

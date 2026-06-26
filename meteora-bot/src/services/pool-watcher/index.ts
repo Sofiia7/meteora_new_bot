@@ -10,6 +10,7 @@ const DEXSCREENER_PAIR = 'https://api.dexscreener.com/latest/dex/pairs/solana';
 
 export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[]) => void;
 export type PoolTimeoutCallback = (tokenAddress: string, tokenSymbol: string) => void;
+export type PoolNoneCallback = (tokenAddress: string, tokenSymbol: string) => void;
 
 interface WatchEntry {
   tokenAddress: string;
@@ -19,12 +20,15 @@ interface WatchEntry {
   timeoutHandle: NodeJS.Timeout;
   /** Адреса пулов, о которых уже уведомили — чтобы не спамить тем же набором. */
   notifiedPoolAddrs: Set<string>;
+  /** Сообщили ли уже «пулов пока нет» (один раз на старте наблюдения). */
+  notifiedNoPools: boolean;
 }
 
 export class PoolWatcher {
   private watching = new Map<string, WatchEntry>();
   private onFoundCallbacks: PoolFoundCallback[] = [];
   private onTimeoutCallbacks: PoolTimeoutCallback[] = [];
+  private onNoneCallbacks: PoolNoneCallback[] = [];
 
   onPoolFound(cb: PoolFoundCallback): void {
     this.onFoundCallbacks.push(cb);
@@ -32,6 +36,11 @@ export class PoolWatcher {
 
   onTimeout(cb: PoolTimeoutCallback): void {
     this.onTimeoutCallbacks.push(cb);
+  }
+
+  /** Первая проверка не нашла пулов — сообщаем пользователю, что наблюдаем. */
+  onNoPools(cb: PoolNoneCallback): void {
+    this.onNoneCallbacks.push(cb);
   }
 
   watch(tokenAddress: string, tokenSymbol: string): void {
@@ -62,6 +71,7 @@ export class PoolWatcher {
       intervalHandle,
       timeoutHandle,
       notifiedPoolAddrs: new Set<string>(),
+      notifiedNoPools: false,
     });
 
     // Run immediately on first check
@@ -87,11 +97,19 @@ export class PoolWatcher {
 
     try {
       const pools = await this.fetchPools(tokenAddress);
-      if (pools.length === 0) return; // пулов пока нет — продолжаем ждать до таймаута
+      if (pools.length === 0) {
+        // Пулов пока нет — продолжаем ждать до таймаута, но ОДИН раз явно сообщаем
+        // пользователю, что наблюдаем (иначе непонятно, что происходит).
+        if (!entry.notifiedNoPools) {
+          entry.notifiedNoPools = true;
+          for (const cb of this.onNoneCallbacks) cb(tokenAddress, entry.tokenSymbol);
+        }
+        return;
+      }
 
-      // Решение заказчика: НЕ фильтруем по стратегии. Показываем ВСЕ DLMM-пулы
-      // по токену (со всеми fee-%), а человек выбирает, в какой войти и входить ли
-      // вообще. Стратегийный пул лишь помечается ⭐ на стороне бота.
+      // Решение заказчика: НЕ фильтруем по стратегии и по типу. Показываем ВСЕ пулы
+      // Meteora по токену (DLMM + DAMM V2), а человек выбирает. Стратегийный пул
+      // (5% + binStep) помечается ⭐, если параметры известны.
       //
       // Не спамим: уведомляем только если появились пулы, которых ещё не показывали.
       const hasNew = pools.some((p) => !entry.notifiedPoolAddrs.has(p.address));
@@ -99,7 +117,7 @@ export class PoolWatcher {
 
       for (const p of pools) entry.notifiedPoolAddrs.add(p.address);
       logger.info(
-        `Pools for ${entry.tokenSymbol}: ${pools.length} DLMM pool(s), notifying for manual choice`
+        `Pools for ${entry.tokenSymbol}: ${pools.length} Meteora pool(s), notifying for manual choice`
       );
       // Watch НЕ останавливаем — вход/отмену решает пользователь (кнопки):
       //   • «войти» → main.ts вызовет stopWatching при открытии позиции;
@@ -119,12 +137,13 @@ export class PoolWatcher {
       );
       const pairs: DexPair[] = Array.isArray(resp.data) ? resp.data : [];
       return pairs
-        .filter((p) => p.dexId === 'meteora' && (p.labels ?? []).includes('DLMM'))
+        .filter((p) => p.dexId === 'meteora') // все типы пулов Meteora (DLMM + DAMM V2)
         .map((p) => ({
           address: p.pairAddress,
           tokenMint: tokenAddress,
-          // DexScreener не отдаёт fee-тир и bin_step Meteora-пула, а dlmm-api сейчас 404.
-          // 0 = «неизвестно»; бот показывает пул как DLMM без тира (см. notifyPoolFound).
+          poolType: labelToPoolType(p.labels),
+          // DexScreener не отдаёт fee-тир и bin_step, а dlmm-api сейчас 404.
+          // 0 = «неизвестно»; бот показывает тип пула без тира (см. notifyPoolFound).
           feeBps: 0,
           binStep: 0,
           tvl: p.liquidity?.usd ?? 0,
@@ -145,6 +164,15 @@ interface DexPair {
   labels?: string[];
   priceUsd?: string;
   liquidity?: { usd?: number };
+}
+
+/** Метка DexScreener → человекочитаемый тип пула Meteora. */
+function labelToPoolType(labels?: string[]): string {
+  const l = labels ?? [];
+  if (l.includes('DLMM')) return 'DLMM';
+  if (l.includes('DYN2')) return 'DAMM V2';
+  if (l.includes('DYN')) return 'DAMM';
+  return l[0] ?? 'Meteora';
 }
 
 /**
