@@ -104,7 +104,7 @@ function sleep(ms: number): Promise<void> {
 
 // Одна очередь на источник. 200ms throttle — рекомендация ТЗ для DexScreener.
 export const dexscreenerQ = new HttpQueue('DexScreener', 200);
-export const meteoraQ = new HttpQueue('Meteora', 200);
-export const gmgnQ = new HttpQueue('GMGN', 500);
 export const rugcheckQ = new HttpQueue('RugCheck', 500);
 export const bubblemapsQ = new HttpQueue('BubbleMaps', 500);
+// GeckoTerminal free tier ~30 req/min → ~2с throttle.
+export const geckoQ = new HttpQueue('GeckoTerminal', 2100);

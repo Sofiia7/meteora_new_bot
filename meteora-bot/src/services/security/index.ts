@@ -1,39 +1,38 @@
-import { gmgnQ, rugcheckQ, bubblemapsQ } from '../../shared/http-queue';
+import { rugcheckQ, bubblemapsQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { cacheGet, cacheSet } from '../../shared/redis';
 import { SecurityResult } from '../../shared/types';
+import { GeckoTerminal } from '../geckoterminal';
 
 const RUGCHECK_API = 'https://api.rugcheck.xyz/v1';
-const GMGN_API = 'https://gmgn.ai/defi/router/v1/sol/token_info';
 const BUBBLEMAPS_API = 'https://api-legacy.bubblemaps.io/map-metadata';
 
 /**
- * Веса скоринга (0–100). Откалибровано по живым ответам (Фаза 4, верифицировано):
- *  - GMGN на VPS отдаёт 403 (Cloudflare) → за его недоступность НЕ штрафуем,
- *    иначе любой токен валится не по своей вине.
- *  - RugCheck — основной риск-источник. `score_normalised` это РИСК (0=безопасно,
- *    100=максимальный риск), поэтому высокий = плохо.
- *  - BubbleMaps `/map-metadata` отдаёт `decentralisation_score` (0–100, выше=лучше),
- *    а НЕ список холдеров.
+ * Веса скоринга (0–100). Откалибровано по живым ответам (Phase 4 + 7, верифицировано):
+ *  - GMGN на VPS = 403 (Cloudflare). Заменён на GeckoTerminal: соцсети + gt_score.
+ *  - RugCheck — основной риск-источник. `score_normalised` это РИСК (0=безопасно, 100=макс).
+ *  - BubbleMaps `/map-metadata` отдаёт `decentralisation_score` (0–100, выше=лучше).
+ *  - GeckoTerminal `gt_score` (0–100, выше=больше доверия) + twitter_handle.
  * Hard-fail (honeypot / mint|freeze authority) перебивает скор.
  */
 const PENALTY = {
-  gmgnLowFees: 10,
   noTwitter: 5,
-  rugcheckUnavailable: 30, // fail-closed: главный источник недоступен
+  geckoLowScore: 20, // gt_score < 30
+  geckoMedScore: 8, // gt_score 30..50
+  rugcheckUnavailable: 30,
   rugcheckRiskHigh: 30, // risk >= 60
   rugcheckRiskMed: 12, // risk 30..60
-  rugcheckDanger: 25, // есть risk level=danger (помимо authority/honeypot)
+  rugcheckDanger: 25,
   bubblemapsUnavailable: 15,
-  lowDecentralisationHard: 25, // decentralisation < 15
-  lowDecentralisationMed: 12, // decentralisation < 30
+  lowDecentralisationHard: 25, // < 15
+  lowDecentralisationMed: 12, // < 30
 };
 
-export interface GmgnData {
+export interface GeckoData {
   available: boolean;
-  totalFeesSol: number;
-  hasTwitter: boolean;
+  twitterActive: boolean;
+  gtScore: number | null;
 }
 
 export interface RugcheckData {
@@ -53,10 +52,8 @@ export interface BubbleMapsData {
 }
 
 export class SecurityChecker {
-  /**
-   * Проверка безопасности токена. Score-based + fail-closed (Фаза 4).
-   * @param opts.bypassCache — для периодического re-check активных позиций (panic F4).
-   */
+  private gecko = new GeckoTerminal();
+
   async check(tokenAddress: string, opts?: { bypassCache?: boolean }): Promise<SecurityResult> {
     const cacheKey = `security:${tokenAddress}`;
     if (!opts?.bypassCache) {
@@ -66,14 +63,14 @@ export class SecurityChecker {
 
     logger.info(`Security check for ${tokenAddress}${opts?.bypassCache ? ' (fresh)' : ''}`);
 
-    const [gmgn, rugcheck, bubbleMaps] = await Promise.allSettled([
-      this.checkGmgn(tokenAddress),
+    const [gecko, rugcheck, bubbleMaps] = await Promise.allSettled([
+      this.checkGecko(tokenAddress),
       this.checkRugcheck(tokenAddress),
       this.checkBubbleMaps(tokenAddress),
     ]);
 
     const result = evaluateSecurity(
-      settled(gmgn, FALLBACK_GMGN),
+      settled(gecko, FALLBACK_GECKO),
       settled(rugcheck, FALLBACK_RUGCHECK),
       settled(bubbleMaps, FALLBACK_BUBBLEMAPS)
     );
@@ -84,20 +81,9 @@ export class SecurityChecker {
 
   // ─── Источники (верифицировано против живых ответов) ──────────────────────────
 
-  private async checkGmgn(tokenAddress: string): Promise<GmgnData> {
-    try {
-      const resp = await gmgnQ.get(`${GMGN_API}/${tokenAddress}`, { timeout: 8000 });
-      const d = resp.data?.data ?? {};
-      return {
-        available: true,
-        totalFeesSol: parseFloat(d.total_fees_sol ?? d.fee_sol ?? '0') || 0,
-        hasTwitter: !!(d.twitter || d.social?.twitter || d.twitter_username),
-      };
-    } catch (err) {
-      // На VPS обычно 403 Cloudflare — это ожидаемо, не вина токена.
-      logger.warn(`GMGN unavailable for ${tokenAddress}: ${err}`);
-      return { ...FALLBACK_GMGN };
-    }
+  private async checkGecko(tokenAddress: string): Promise<GeckoData> {
+    const meta = await this.gecko.tokenMeta(tokenAddress);
+    return { available: meta.available, twitterActive: meta.twitterActive, gtScore: meta.gtScore };
   }
 
   private async checkRugcheck(tokenAddress: string): Promise<RugcheckData> {
@@ -133,7 +119,6 @@ export class SecurityChecker {
         { timeout: 8000 }
       );
       const d = resp.data ?? {};
-      // Реальный ответ: { status:"OK", decentralisation_score:42.6, identified_supply:{...} }.
       if ((d.status ?? '').toString().toUpperCase() !== 'OK') return { ...FALLBACK_BUBBLEMAPS };
       const ds = typeof d.decentralisation_score === 'number' ? d.decentralisation_score : 0;
       return { available: true, decentralisationScore: ds };
@@ -149,7 +134,7 @@ export class SecurityChecker {
  * passed = !hardFail && score >= MIN_SECURITY_SCORE.
  */
 export function evaluateSecurity(
-  gmgn: GmgnData,
+  gecko: GeckoData,
   rug: RugcheckData,
   bm: BubbleMapsData
 ): SecurityResult {
@@ -158,21 +143,25 @@ export function evaluateSecurity(
   const warnings: string[] = [];
   const sourcesUnavailable: string[] = [];
 
-  // ── GMGN: fees + twitter. Недоступность НЕ штрафуем (Cloudflare на VPS). ──────
+  // ── GeckoTerminal: соцсети + gt_score (замена GMGN) ───────────────────────────
   let twitterActive = false;
-  if (!gmgn.available) {
-    sourcesUnavailable.push('GMGN');
+  const gtScore = gecko.available ? gecko.gtScore : null;
+  if (!gecko.available) {
+    sourcesUnavailable.push('GeckoTerminal');
   } else {
-    twitterActive = gmgn.hasTwitter;
-    if (gmgn.totalFeesSol < config.security.minGmgnFeesSol) {
-      score -= PENALTY.gmgnLowFees;
-      warnings.push(
-        `GMGN fees низкие: ${gmgn.totalFeesSol.toFixed(1)} SOL (мин ${config.security.minGmgnFeesSol})`
-      );
-    }
+    twitterActive = gecko.twitterActive;
     if (!twitterActive) {
       score -= PENALTY.noTwitter;
       warnings.push('Нет Twitter/соц-активности');
+    }
+    if (gtScore !== null) {
+      if (gtScore < 30) {
+        score -= PENALTY.geckoLowScore;
+        warnings.push(`Низкий gt_score: ${gtScore.toFixed(0)}/100`);
+      } else if (gtScore < 50) {
+        score -= PENALTY.geckoMedScore;
+        warnings.push(`Средний gt_score: ${gtScore.toFixed(0)}/100`);
+      }
     }
   }
 
@@ -247,7 +236,7 @@ export function evaluateSecurity(
     passed,
     score,
     hardFail,
-    gmgnFeesSol: gmgn.totalFeesSol,
+    gtScore,
     rugcheckStatus: rugStatus,
     decentralisationScore,
     twitterActive,
@@ -261,7 +250,7 @@ export function evaluateSecurity(
 
 // ─── Helpers / fallbacks ────────────────────────────────────────────────────────
 
-const FALLBACK_GMGN: GmgnData = { available: false, totalFeesSol: 0, hasTwitter: false };
+const FALLBACK_GECKO: GeckoData = { available: false, twitterActive: false, gtScore: null };
 const FALLBACK_RUGCHECK: RugcheckData = {
   available: false,
   riskScore: null,

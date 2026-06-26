@@ -21,7 +21,8 @@ export interface SecurityResult {
   score: number;
   /** Жёсткий провал: honeypot / активные authority / RugCheck danger. Перебивает score. */
   hardFail: boolean;
-  gmgnFeesSol: number;
+  /** GeckoTerminal gt_score 0–100 (выше = больше доверия). null если недоступно. */
+  gtScore: number | null;
   rugcheckStatus: string;
   /** BubbleMaps decentralisation_score 0–100 (выше = лучше). 0 если источник недоступен. */
   decentralisationScore: number;

@@ -111,6 +111,7 @@ export class TelegramBot {
       '',
       `🧮 Security score: ${security.score}/100${security.hardFail ? ' — ❌ HARD-FAIL' : ''}`,
       `🛡 RugCheck: ${escHtml(security.rugcheckStatus)}`,
+      `🦎 GeckoTerminal gt_score: ${security.gtScore !== null ? `${security.gtScore.toFixed(0)}/100` : 'n/a'}`,
       `🫧 BubbleMaps децентрализация: ${security.decentralisationScore.toFixed(0)}/100`,
       `🐦 Twitter: ${security.twitterActive ? 'есть' : 'нет'}`,
     ];
