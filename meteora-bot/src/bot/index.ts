@@ -4,6 +4,7 @@ import { logger } from '../shared/logger';
 import { Positions, WatchedTokens } from '../shared/repositories';
 import { SecurityResult, TokenInfo, PoolInfo, Position, ExitReason, AiVerdict } from '../shared/types';
 import { tokenLinks, meteoraPoolUrl, ResourceLink } from '../shared/links';
+import { ChartHealth } from '../services/chart-health';
 
 export class TelegramBot {
   readonly bot: Telegraf;
@@ -97,8 +98,17 @@ export class TelegramBot {
 
   // ─── Outbound notifications ────────────────────────────────────────────────
 
-  async notifyNewToken(token: TokenInfo, security: SecurityResult, ai?: AiVerdict): Promise<void> {
+  async notifyNewToken(
+    token: TokenInfo,
+    security: SecurityResult,
+    ai?: AiVerdict,
+    health?: ChartHealth
+  ): Promise<void> {
     const statusIcon = security.passed ? '✅' : '⚠️';
+    const chartLine = health
+      ? `📉 От ATH: -${health.athDistancePct.toFixed(0)}%` +
+        (health.rsi !== null ? ` · RSI(15м): ${health.rsi.toFixed(0)}` : '')
+      : null;
     const text = [
       `${statusIcon} <b>Найден токен: ${escHtml(token.symbol)}</b>`,
       `CA: <code>${escHtml(token.address)}</code>`,
@@ -108,6 +118,7 @@ export class TelegramBot {
       `📊 Volume 24h: $${fmt(token.volume24h)}`,
       `💵 Price: $${token.priceUsd.toFixed(8)}`,
       `💧 Liquidity: $${fmt(token.liquidity)}`,
+      ...(chartLine ? [chartLine] : []),
       '',
       `🧮 Security score: ${security.score}/100${security.hardFail ? ' — ❌ HARD-FAIL' : ''}`,
       `🛡 RugCheck: ${escHtml(security.rugcheckStatus)}`,

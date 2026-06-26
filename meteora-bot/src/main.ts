@@ -81,8 +81,8 @@ async function main(): Promise<void> {
     logger.info(`${prefix}Processing token: ${token.symbol} (${token.address})`);
     Tokens.upsert(token);
 
-    // 1. Chart-health (ТЗ 1.2).
-    const health = chartHealth.analyze(token);
+    // 1. Chart-health (ТЗ 1.2). Реальный ATH/RSI из 15м-свечей GeckoTerminal.
+    const health = await chartHealth.analyze(token);
     if (!health.passes) {
       logger.info(
         `${token.symbol} health score ${health.score}/100 < min ${health.score}, skip. ` +
@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     Tokens.setSecurity(token.address, secResult.passed, secResult.warnings);
 
     const aiVerdict = await aiAnalyst.analyzeToken(token, secResult);
-    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
+    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined, health);
 
     if (!secResult.passed) {
       await tgBot.notifySecurityFailed(token, secResult);
@@ -222,8 +222,9 @@ async function main(): Promise<void> {
     }
 
     const secResult = await security.check(token.address);
+    const health = await chartHealth.analyze(token);
     const aiVerdict = await aiAnalyst.analyzeToken(token, secResult);
-    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined);
+    await tgBot.notifyNewToken(token, secResult, aiVerdict ?? undefined, health);
 
     if (!secResult.passed) {
       await tgBot.notifySecurityFailed(token, secResult);
