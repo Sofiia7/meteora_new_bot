@@ -178,11 +178,14 @@ Defaults: `ATH_RENOTIFY_PCT=10`, `ATH_RENOTIFY_COOLDOWN_MIN=30`.
 - [ ] Integration: Telegram callbacks via `bot.handleUpdate`, DB, mocked Meteora/Jupiter.
 - [ ] Limited mainnet smoke with a minimal amount (devnet N/A — no memecoin pools).
 
-### Phase 7 — GeckoTerminal + external-API resilience 🦎 (in progress)
+### Phase 7 — GeckoTerminal + external-API resilience 🦎 ✅
 - External-API status (verified live): **Meteora `dlmm-api` is 404** → pool discovery via
   **DexScreener** (`token-pairs`, all Meteora pool types: DLMM + DAMM V2). **GMGN is 403** on the VPS.
-- [ ] **GeckoTerminal** (free, no key): socials + `gt_score` into security (fills the GMGN gap);
-  **OHLCV** candles for a real ATH and 15m RSI.
+- [x] **GeckoTerminal** (free, no key) replaces the dead GMGN in security: `twitter_handle` /
+  `websites` → `twitterActive`, and `gt_score` (0–100 trust) as a factor. Verified against live `/info`.
+- [x] **GeckoTerminal OHLCV** (15m candles): chart-health now computes a real ATH (max high +
+  rolling `token_ath`) and a real 15m RSI(14); the alert shows "From ATH -X% · RSI(15m) Y".
+- [x] "No pools yet" notification + all Meteora pool types (DLMM + DAMM V2) surfaced.
 - [ ] fee-tier / bin-step enrichment via the on-chain DLMM SDK (DexScreener doesn't expose them).
 
 ---
