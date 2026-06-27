@@ -9,7 +9,12 @@ const DEXSCREENER_TOKEN_PAIRS = 'https://api.dexscreener.com/token-pairs/v1/sola
 const DEXSCREENER_PAIR = 'https://api.dexscreener.com/latest/dex/pairs/solana';
 
 export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[]) => void;
-export type PoolTimeoutCallback = (tokenAddress: string, tokenSymbol: string) => void;
+/** foundAny = были ли вообще показаны пулы (для корректного текста таймаута). */
+export type PoolTimeoutCallback = (
+  tokenAddress: string,
+  tokenSymbol: string,
+  foundAny: boolean
+) => void;
 export type PoolNoneCallback = (tokenAddress: string, tokenSymbol: string) => void;
 
 interface WatchEntry {
@@ -59,9 +64,11 @@ export class PoolWatcher {
     );
 
     const timeoutHandle = setTimeout(() => {
+      const e = this.watching.get(tokenAddress);
+      const foundAny = e ? e.notifiedPoolAddrs.size > 0 : false;
       this.stopWatching(tokenAddress);
-      logger.info(`Pool watch timeout for ${tokenSymbol}`);
-      for (const cb of this.onTimeoutCallbacks) cb(tokenAddress, tokenSymbol);
+      logger.info(`Pool watch timeout for ${tokenSymbol} (foundAny=${foundAny})`);
+      for (const cb of this.onTimeoutCallbacks) cb(tokenAddress, tokenSymbol, foundAny);
     }, config.poolWatcher.watchTimeoutMs);
 
     this.watching.set(tokenAddress, {
@@ -108,14 +115,18 @@ export class PoolWatcher {
       }
 
       // Решение заказчика: НЕ фильтруем по стратегии и по типу. Показываем ВСЕ пулы
-      // Meteora по токену (DLMM + DAMM V2), а человек выбирает. Стратегийный пул
-      // (5% + binStep) помечается ⭐, если параметры известны.
+      // Meteora по токену (DLMM + DAMM V2), а человек выбирает.
       //
-      // Не спамим: уведомляем только если появились пулы, которых ещё не показывали.
-      const hasNew = pools.some((p) => !entry.notifiedPoolAddrs.has(p.address));
-      if (!hasNew) return;
-
+      // Анти-спам: первый раз уведомляем всегда; повторно — только если появился
+      // ЗНАЧИМЫЙ новый пул (TVL ≥ renotifyMinTvl). Иначе мелкие свежие DAMM-пулы
+      // ($0–14) триггерили дубли всего списка. Все текущие пулы помечаем виденными.
+      const firstTime = entry.notifiedPoolAddrs.size === 0;
+      const significantNew = pools.some(
+        (p) => !entry.notifiedPoolAddrs.has(p.address) && p.tvl >= config.poolWatcher.renotifyMinTvl
+      );
       for (const p of pools) entry.notifiedPoolAddrs.add(p.address);
+      if (!firstTime && !significantNew) return;
+
       logger.info(
         `Pools for ${entry.tokenSymbol}: ${pools.length} Meteora pool(s), notifying for manual choice`
       );

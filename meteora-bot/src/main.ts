@@ -152,9 +152,9 @@ async function main(): Promise<void> {
     await tgBot.notifyPoolFound(token, pools);
   });
 
-  poolWatcher.onTimeout(async (tokenAddress, tokenSymbol) => {
+  poolWatcher.onTimeout(async (tokenAddress, tokenSymbol, foundAny) => {
     WatchedTokens.setStatus(tokenAddress, 'watching', 'timed_out');
-    await tgBot.notifyPoolTimeout(tokenAddress, tokenSymbol);
+    await tgBot.notifyPoolTimeout(tokenAddress, tokenSymbol, foundAny);
   });
 
   // Первая проверка не нашла пулов — сообщаем, что встали в наблюдение.

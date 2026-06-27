@@ -92,6 +92,9 @@ export const config = {
     preferredBinSteps: [80, 100, 125],
     // Сколько пулов максимум показывать кнопками (Telegram-клавиатура + читаемость).
     buttonsMax: intEnv('POOL_BUTTONS_MAX', 8),
+    // Повторно уведомлять о пулах только если появился НОВЫЙ пул с TVL ≥ этого порога.
+    // Иначе мелкие свежие DAMM-пулы ($0–14) спамят дублями списка.
+    renotifyMinTvl: numEnv('POOL_RENOTIFY_MIN_TVL', 1000),
   },
   security: {
     minGmgnFeesSol: numEnv('MIN_GMGN_FEES_SOL', 30),

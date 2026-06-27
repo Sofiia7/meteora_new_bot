@@ -235,9 +235,17 @@ export class TelegramBot {
     ]);
   }
 
-  async notifyPoolTimeout(tokenAddress: string, tokenSymbol: string): Promise<void> {
+  async notifyPoolTimeout(
+    tokenAddress: string,
+    tokenSymbol: string,
+    foundAny = false
+  ): Promise<void> {
+    // Если пулы показывались, но в них не вошли — это НЕ «пул не найден».
+    const head = foundAny
+      ? `⏰ <b>2 часа: вход в пул так и не сделан</b>`
+      : `⏰ <b>Пул не найден за 2 часа</b>`;
     const text = [
-      `⏰ <b>Пул не найден за 2 часа</b>`,
+      head,
       `Токен: ${escHtml(tokenSymbol)}`,
       `CA: <code>${escHtml(tokenAddress)}</code>`,
       this.resourceLine(tokenAddress),
