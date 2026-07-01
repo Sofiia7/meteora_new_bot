@@ -82,11 +82,13 @@ Defaults: `ATH_RENOTIFY_PCT=10`, `ATH_RENOTIFY_COOLDOWN_MIN=30`.
 ### Phase 1 — Money correctness and exits 💰 (test on mainnet with a minimal amount)
 - [x] **Repository layer** with a snake↔camel mapper; remove all `SELECT *` from business code.
 - [x] Fix `closePosition`: `poolAddress`/`positionPubkey`/`tokenAddress` come through the mapper.
-- [ ] SOL side detection: `dlmmPool.tokenX.publicKey.equals(WSOL)` → build `totalXAmount`/`totalYAmount`
-  accordingly; for **single-sided SOL** the range is strictly below the active bin.
-- [ ] **PnL from wallet-balance delta**: `getBalance` before open and after the full exit flow.
-- [ ] Don't swap if the on-chain position isn't found (current code swaps anyway).
-- [ ] `getFeesRatio`: convert `feeX` to SOL at the current pool price, add `feeY` (SOL); divide
+- [x] SOL side detection: `dlmmPool.tokenX/tokenY.publicKey.equals(WSOL)` → build `totalXAmount`/`totalYAmount`
+  accordingly; for **single-sided SOL** the range sits on whichever side the DLMM SDK's bid/ask-side
+  split actually honours for that token (confirmed against SDK source + a live mainnet open/close:
+  SOL=Y → strictly below active bin, SOL=X → strictly above — see `shared/dlmm-range.ts`).
+- [x] **PnL from wallet-balance delta**: `getBalance` before open and after the full exit flow.
+- [x] Don't swap if the on-chain position isn't found (current code swaps anyway).
+- [x] `getFeesRatio`: convert `feeX` to SOL at the current pool price, add `feeY` (SOL); divide
   by `position.solAmount`. This is **unclaimed**.
 - [x] **Remove `stopLossPercent`** from exit-strategy (hidden behind `ENABLE_PRICE_STOP_LOSS=false`).
 - [x] `chart_degradation` → only `notifyDegradation()` with a button, no auto-exit.
@@ -94,7 +96,7 @@ Defaults: `ATH_RENOTIFY_PCT=10`, `ATH_RENOTIFY_COOLDOWN_MIN=30`.
   ticks every 30s, increments factor counters in a window, fires `exit` on the same bus as take-profit.
 - [x] **Manual "🔴 Exit now" button** right on `notifyPositionOpened`. Idempotent on double click.
 - [x] `status='closing'` before exit ops, clear price history only on success.
-- [ ] Priority fees + `simulateTransaction` before send + retry with backoff in `sendTransaction`.
+- [x] Priority fees + `simulateTransaction` before send + retry with backoff in `sendTransaction`.
 
 ### Phase 2 — State & recovery 💾 ✅
 - [x] On `main.ts` startup:
@@ -176,7 +178,9 @@ Defaults: `ATH_RENOTIFY_PCT=10`, `ATH_RENOTIFY_COOLDOWN_MIN=30`.
 - [x] ESLint 9 flat config (`eslint.config.js`) — `npm run lint` green, 0 warnings.
 - [x] GitHub Actions: `tsc --noEmit`, `eslint`, `vitest` on push/PR.
 - [ ] Integration: Telegram callbacks via `bot.handleUpdate`, DB, mocked Meteora/Jupiter.
-- [ ] Limited mainnet smoke with a minimal amount (devnet N/A — no memecoin pools).
+- [x] Limited mainnet smoke with a minimal amount (devnet N/A — no memecoin pools): real
+  open→remove-liquidity→close cycle on `world-SOL` confirmed non-zero deposit and withdrawal
+  (Meteora UI: $1.55 in / $1.55 out) and a normal (non-empty-fallback) `removeLiquidity`.
 
 ### Phase 7 — GeckoTerminal + external-API resilience 🦎 ✅
 - External-API status (verified live): **Meteora `dlmm-api` is 404** → pool discovery via
