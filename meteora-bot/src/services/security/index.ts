@@ -216,7 +216,7 @@ export function evaluateSecurity(
   if (!bm.available) {
     sourcesUnavailable.push('BubbleMaps');
     score -= PENALTY.bubblemapsUnavailable;
-    warnings.push('BubbleMaps недоступен (fail-closed)');
+    warnings.push('BubbleMaps: нет данных по токену (fail-closed)');
     decentralisationScore = 0;
   } else {
     decentralisationScore = bm.decentralisationScore;
