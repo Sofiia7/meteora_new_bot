@@ -3,7 +3,7 @@ import { logger } from '../../shared/logger';
 import { getDb } from '../../shared/db';
 import { Positions, TokenAthRepo } from '../../shared/repositories';
 import { TokenInfo } from '../../shared/types';
-import { ScannerService } from '../scanner';
+import { ScannerService, passesScannerFilters } from '../scanner';
 
 export type RenotifyCallback = (token: TokenInfo, newAth: number, prevNotifiedAth: number) => void;
 
@@ -92,6 +92,10 @@ export class AthWatcher {
   private async checkOne(address: string): Promise<void> {
     const token = await this.scanner.fetchTokenInfo(address);
     if (!token || token.priceUsd <= 0) return;
+    // Токен мог пройти security ДО того, как появился фильтр по возрасту
+    // (или устарел с тех пор) — перепроверяем теми же критериями, иначе
+    // blue-chip вроде JUP/MET продолжит ATH-ренотифай бесконечно.
+    if (!passesScannerFilters(token)) return;
 
     const ath = TokenAthRepo.get(address);
     const prevNotifiedAth = ath?.lastNotifiedAth ?? 0;
