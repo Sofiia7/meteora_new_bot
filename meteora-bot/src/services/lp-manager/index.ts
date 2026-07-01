@@ -247,15 +247,21 @@ export class LpManager {
         return { pnlSol: 0 };
       }
 
-      // 1. Claim fees.
-      const claimTxs = await dlmmPool.claimAllRewardsByPosition({
-        owner: this.wallet.publicKey,
-        position: userPosition,
-      });
-      for (const tx of claimTxs) {
-        await this.sendTransaction(tx as Transaction);
+      // 1. Claim fees. SDK бросает Error('No fee/reward to claim'), если клеймить
+      // нечего (обычная ситуация — а не только для пустых позиций), а не
+      // возвращает []. Ловим отдельно, чтобы не блокировать более важный шаг 2.
+      try {
+        const claimTxs = await dlmmPool.claimAllRewardsByPosition({
+          owner: this.wallet.publicKey,
+          position: userPosition,
+        });
+        for (const tx of claimTxs) {
+          await this.sendTransaction(tx as Transaction);
+        }
+        logger.info(`Fees claimed for position ${positionId}`);
+      } catch (err) {
+        logger.info(`No fees to claim for position ${positionId}: ${err}`);
       }
-      logger.info(`Fees claimed for position ${positionId}`);
 
       // 2. Remove all liquidity.
       const { lowerBinId, upperBinId } = userPosition.positionData;
