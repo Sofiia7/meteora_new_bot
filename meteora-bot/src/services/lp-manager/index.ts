@@ -264,19 +264,36 @@ export class LpManager {
       }
 
       // 2. Remove all liquidity.
-      const { lowerBinId, upperBinId } = userPosition.positionData;
-      const removeTxs = await dlmmPool.removeLiquidity({
-        user: this.wallet.publicKey,
-        position: userPosition.publicKey,
-        fromBinId: lowerBinId,
-        toBinId: upperBinId,
-        bps: new BN(10000),
-        shouldClaimAndClose: true,
-      });
-      for (const tx of Array.isArray(removeTxs) ? removeTxs : [removeTxs]) {
-        await this.sendTransaction(tx as Transaction);
+      try {
+        const { lowerBinId, upperBinId } = userPosition.positionData;
+        const removeTxs = await dlmmPool.removeLiquidity({
+          user: this.wallet.publicKey,
+          position: userPosition.publicKey,
+          fromBinId: lowerBinId,
+          toBinId: upperBinId,
+          bps: new BN(10000),
+          shouldClaimAndClose: true,
+        });
+        for (const tx of Array.isArray(removeTxs) ? removeTxs : [removeTxs]) {
+          await this.sendTransaction(tx as Transaction);
+        }
+        logger.info(`Liquidity removed for position ${positionId}`);
+      } catch (err) {
+        // SDK-баг: removeLiquidity({shouldClaimAndClose:true}) падает с
+        // "Cannot read properties of undefined (reading 'binId')", если у
+        // позиции ОДНОВРЕМЕННО нет ни ликвидности, ни комиссий (пустая позиция,
+        // напр. из-за прошлого бага с диапазоном бинов). SDK для этого случая
+        // отдельно предоставляет closePositionIfEmpty — используем как fallback.
+        logger.warn(
+          `removeLiquidity failed for position ${positionId} (${err}), trying closePositionIfEmpty`
+        );
+        const closeTx = await dlmmPool.closePositionIfEmpty({
+          owner: this.wallet.publicKey,
+          position: userPosition,
+        });
+        await this.sendTransaction(closeTx as Transaction);
+        logger.info(`Empty position ${positionId} closed via closePositionIfEmpty`);
       }
-      logger.info(`Liquidity removed for position ${positionId}`);
 
       // 3. Swap полученный мемкоин → SOL (если что-то осталось).
       const tokenBalance = await this.getTokenBalance(position.tokenAddress);
