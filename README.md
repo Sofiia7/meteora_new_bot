@@ -145,6 +145,21 @@ ENABLE_MAINNET_TRADING=true
 
 The bot has already run on mainnet with real money. Start with a small `LP_AMOUNT_SOL`.
 
+## 💸 Optional swap fee (Jupiter referral)
+
+Exiting a position swaps the memecoin back to SOL via the [Jupiter Swap API](https://dev.jup.ag/docs/swap-api/add-fees-to-swap).
+This fork can optionally take a small cut of that swap for the maintainer, using Jupiter's
+built-in `platformFeeBps` + `feeAccount` mechanism (no separate referral-account signup needed).
+
+- `JUPITER_PLATFORM_FEE_BPS` — fee in basis points (e.g. `50` = 0.5%). **Default `0` = disabled**,
+  swaps go through with no extra cut.
+- `JUPITER_FEE_ACCOUNT` — a SOL/wSOL token account you own that receives the fee. Required only
+  if `JUPITER_PLATFORM_FEE_BPS > 0`.
+
+If you fork this bot and keep these set to the maintainer's values, a small percentage of your
+exit swaps supports development. Feel free to blank them out or point them at your own account —
+nothing else in the bot depends on this.
+
 ## ✅ Code quality
 
 ```bash

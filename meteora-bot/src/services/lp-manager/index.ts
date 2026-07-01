@@ -15,9 +15,9 @@ import { config, isMainnetTradingEnabled } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { Positions } from '../../shared/repositories';
 import { PoolInfo, Position } from '../../shared/types';
+import { buildJupiterQuoteParams, buildJupiterSwapBody } from '../../shared/jupiter';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
 
 export class LpManager {
   private connection: Connection;
@@ -395,25 +395,26 @@ export class LpManager {
       const decimals = (decimalsInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
       const amountRaw = Math.floor(amount * 10 ** decimals);
 
-      const quoteResp = await axios.get(`${JUPITER_QUOTE_API}/quote`, {
-        params: {
+      const quoteResp = await axios.get(`${config.jupiter.apiBase}/quote`, {
+        params: buildJupiterQuoteParams({
           inputMint: tokenMint,
           outputMint: WSOL_MINT,
-          amount: amountRaw,
+          amountRaw,
           slippageBps: config.lp.swapSlippageBps,
-        },
+          platformFeeBps: config.jupiter.platformFeeBps,
+        }),
         timeout: 10000,
       });
 
       const quote = quoteResp.data;
 
       const swapResp = await axios.post(
-        `${JUPITER_QUOTE_API}/swap`,
-        {
+        `${config.jupiter.apiBase}/swap`,
+        buildJupiterSwapBody({
           quoteResponse: quote,
           userPublicKey: this.wallet.publicKey.toBase58(),
-          wrapAndUnwrapSol: true,
-        },
+          feeAccount: config.jupiter.feeAccount,
+        }),
         { timeout: 15000 }
       );
 

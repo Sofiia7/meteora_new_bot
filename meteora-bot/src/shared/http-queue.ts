@@ -108,3 +108,5 @@ export const rugcheckQ = new HttpQueue('RugCheck', 500);
 export const bubblemapsQ = new HttpQueue('BubbleMaps', 500);
 // GeckoTerminal free tier ~30 req/min → ~2с throttle.
 export const geckoQ = new HttpQueue('GeckoTerminal', 2100);
+// Meteora DLMM data API — лимит 30 RPS (документация), 250мс с запасом.
+export const meteoraQ = new HttpQueue('MeteoraDlmm', 250);

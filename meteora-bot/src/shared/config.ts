@@ -163,6 +163,15 @@ export const config = {
   redis: {
     url: process.env['REDIS_URL'] ?? 'redis://localhost:6379',
   },
+  // Jupiter Swap API — используется при выходе из позиции (своп мемкоина в SOL).
+  // quote-api.jup.ag/v6 мёртв (проверено вживую); текущий бесплатный эндпоинт —
+  // lite-api.jup.ag/swap/v1. platformFeeBps/feeAccount — опциональная реферальная
+  // комиссия (см. README): 0/пусто = выключена, своп идёт без надбавки.
+  jupiter: {
+    apiBase: process.env['JUPITER_API_BASE'] ?? 'https://lite-api.jup.ag/swap/v1',
+    platformFeeBps: intEnv('JUPITER_PLATFORM_FEE_BPS', 0),
+    feeAccount: process.env['JUPITER_FEE_ACCOUNT'] ?? '',
+  },
 };
 
 export function isMainnetTradingEnabled(): boolean {

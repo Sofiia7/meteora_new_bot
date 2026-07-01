@@ -1,4 +1,4 @@
-import { dexscreenerQ } from '../../shared/http-queue';
+import { dexscreenerQ, meteoraQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { cacheGet, cacheSet } from '../../shared/redis';
@@ -9,6 +9,20 @@ import { TokenInfo } from '../../shared/types';
 const SEEN_WINDOW_SEC = 24 * 60 * 60; // 24 часа
 
 const DEXSCREENER_API = 'https://api.dexscreener.com/token-profiles/latest/v1';
+
+// Живой (проверено вручную) домен Meteora DLMM data-API — не dlmm-api.meteora.ag
+// (тот 404 на все пути), см. https://docs.meteora.ag/developer-guides/dlmm/api-reference/overview.
+// В отличие от DexScreener token-profiles (только СВЕЖЕ поданные профили — узкое
+// окно, легко пропустить старый, но живой токен вроде ANSEM), здесь можно взять
+// пулы по всей сети, отсортированные по объёму — независимо от возраста токена.
+const METEORA_POOLS_API = 'https://dlmm.datapi.meteora.ag/pools';
+
+/** Мажорные монеты — если ОБЕ стороны пула из этого списка, это не токен-кандидат. */
+const MAJOR_MINTS = new Set([
+  'So11111111111111111111111111111111111111112', // SOL (wrapped)
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+]);
 
 export type ScannerCallback = (token: TokenInfo) => void;
 
@@ -44,9 +58,9 @@ export class ScannerService {
   }
 
   private async scan(): Promise<void> {
-    logger.info('Running DexScreener scan...');
+    logger.info('Running scanner tick...');
     try {
-      const tokens = await this.fetchLatestSolanaTokens();
+      const tokens = await this.fetchCandidates();
       for (const token of tokens) {
         // Персистентная дедупликация: переживает рестарты (раньше Set in-memory
         // → после рестарта шквал повторных уведомлений). 24-часовое окно
@@ -67,6 +81,52 @@ export class ScannerService {
 
   private passesFilters(token: TokenInfo): boolean {
     return passesScannerFilters(token);
+  }
+
+  /**
+   * Кандидаты из двух независимых источников:
+   *  - DexScreener token-profiles — только свежеПОДАННЫЕ профили (узкое окно,
+   *    пропускает старые, но живые токены);
+   *  - Meteora DLMM pools по всей сети, топ по объёму — ловит активные пулы
+   *    независимо от возраста токена (см. кейс ANSEM: старый токен, но #2
+   *    по 24ч-объёму среди ВСЕХ DLMM-пулов сети).
+   * Источники независимы: ошибка одного не блокирует другой. Дедуп по адресу.
+   */
+  private async fetchCandidates(): Promise<TokenInfo[]> {
+    const [dexscreenerTokens, meteoraTokens] = await Promise.all([
+      this.fetchLatestSolanaTokens().catch((err) => {
+        logger.error(`DexScreener candidates fetch error: ${err}`);
+        return [] as TokenInfo[];
+      }),
+      this.fetchTopMeteoraTokens().catch((err) => {
+        logger.error(`Meteora pools fetch error: ${err}`);
+        return [] as TokenInfo[];
+      }),
+    ]);
+
+    const merged = new Map<string, TokenInfo>();
+    for (const t of [...dexscreenerTokens, ...meteoraTokens]) {
+      if (!merged.has(t.address)) merged.set(t.address, t);
+    }
+    return [...merged.values()];
+  }
+
+  private async fetchTopMeteoraTokens(): Promise<TokenInfo[]> {
+    const cacheKey = 'scanner:meteora_pools';
+    const cached = await cacheGet(cacheKey);
+    if (cached) return JSON.parse(cached) as TokenInfo[];
+
+    const resp = await meteoraQ.get<{ data: MeteoraDlmmPool[] }>(METEORA_POOLS_API, {
+      params: { page: 1, page_size: 50, sort_by: 'volume_24h:desc' },
+      timeout: 10000,
+    });
+    const pools = resp.data?.data ?? [];
+    const tokens = pools
+      .map(mapMeteoraPoolToTokenInfo)
+      .filter((t): t is TokenInfo => t !== null);
+
+    await cacheSet(cacheKey, JSON.stringify(tokens), 240); // cache 4 min, как DexScreener
+    return tokens;
   }
 
   private async fetchLatestSolanaTokens(): Promise<TokenInfo[]> {
@@ -177,4 +237,60 @@ function pairToTokenInfo(pair: DexScreenerPair): TokenInfo | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface MeteoraTokenSide {
+  address: string;
+  name: string;
+  symbol: string;
+  decimals: number;
+  is_verified: boolean;
+  holders: number;
+  freeze_authority_disabled: boolean;
+  total_supply: number;
+  price: number;
+  market_cap: number;
+}
+
+export interface MeteoraDlmmPool {
+  address: string;
+  name: string;
+  token_x: MeteoraTokenSide;
+  token_y: MeteoraTokenSide;
+  created_at: number;
+  pool_config: { bin_step: number; base_fee_pct: number };
+  tvl: number;
+  volume: { '30m': number; '1h': number; '2h': number; '4h': number; '12h': number; '24h': number };
+  is_blacklisted: boolean;
+}
+
+/**
+ * Пул Meteora DLMM (dlmm.datapi.meteora.ag) → кандидат TokenInfo для сканера.
+ * Берём НЕ-мажорную сторону пула (не SOL/USDC/USDT) как токен; если обе
+ * стороны мажорные (SOL-USDC) или пул в блэклисте — не кандидат (null).
+ */
+export function mapMeteoraPoolToTokenInfo(pool: MeteoraDlmmPool): TokenInfo | null {
+  if (pool.is_blacklisted) return null;
+
+  const xIsMajor = MAJOR_MINTS.has(pool.token_x.address);
+  const yIsMajor = MAJOR_MINTS.has(pool.token_y.address);
+  if (xIsMajor && yIsMajor) return null;
+  const token = xIsMajor ? pool.token_y : pool.token_x;
+
+  return {
+    address: token.address,
+    symbol: token.symbol,
+    name: token.name,
+    marketCap: token.market_cap,
+    volume24h: pool.volume['24h'],
+    priceUsd: token.price,
+    priceChange24h: 0,
+    ath: 0,
+    athDate: '',
+    liquidity: pool.tvl,
+    pairAddress: pool.address,
+    dexId: 'meteora',
+    chainId: 'solana',
+    createdAt: pool.created_at,
+  };
 }
