@@ -1,12 +1,16 @@
-import { dexscreenerQ } from '../../shared/http-queue';
+import { dexscreenerQ, meteoraQ } from '../../shared/http-queue';
 import { config } from '../../shared/config';
 import { logger } from '../../shared/logger';
 import { PoolInfo } from '../../shared/types';
 
-// Источник пулов — DexScreener: dlmm-api.meteora.ag сейчас отдаёт 404 на все эндпоинты,
-// а DexScreener надёжно возвращает пары токена с пометкой dexId=meteora + labels=[DLMM].
+// Список пулов токена (DLMM + DAMM V2) — DexScreener, надёжно отдаёт пары с
+// пометкой dexId=meteora + labels=[DLMM]/[DYN2]. Но DexScreener не знает
+// fee-тир/bin_step, поэтому для DLMM-пулов дополнительно обогащаем данными
+// с живого Meteora DLMM data-API (см. enrichDlmmPool ниже; НЕ dlmm-api.meteora.ag —
+// тот 404, правильный домен dlmm.datapi.meteora.ag, см. developer-docs).
 const DEXSCREENER_TOKEN_PAIRS = 'https://api.dexscreener.com/token-pairs/v1/solana';
 const DEXSCREENER_PAIR = 'https://api.dexscreener.com/latest/dex/pairs/solana';
+const METEORA_POOL_DETAIL_API = 'https://dlmm.datapi.meteora.ag/pools';
 
 export type PoolFoundCallback = (tokenAddress: string, pools: PoolInfo[]) => void;
 /** foundAny = были ли вообще показаны пулы (для корректного текста таймаута). */
@@ -147,21 +151,35 @@ export class PoolWatcher {
         { timeout: 10000 }
       );
       const pairs: DexPair[] = Array.isArray(resp.data) ? resp.data : [];
-      return pairs
+      const pools = pairs
         .filter((p) => p.dexId === 'meteora') // все типы пулов Meteora (DLMM + DAMM V2)
         .map((p) => ({
           address: p.pairAddress,
           tokenMint: tokenAddress,
           poolType: labelToPoolType(p.labels),
-          // DexScreener не отдаёт fee-тир и bin_step, а dlmm-api сейчас 404.
-          // 0 = «неизвестно»; бот показывает тип пула без тира (см. notifyPoolFound).
+          // DexScreener не отдаёт fee-тир и bin_step — заглушка 0, ниже для
+          // DLMM-пулов перезаписывается реальными данными (enrichDlmmPool).
           feeBps: 0,
           binStep: 0,
           tvl: p.liquidity?.usd ?? 0,
           activeBinId: 0,
           currentPrice: parseFloat(p.priceUsd ?? '0') || 0,
-        }))
-        .sort((a, b) => b.tvl - a.tvl);
+        }));
+
+      await Promise.all(
+        pools
+          .filter((p) => p.poolType === 'DLMM')
+          .map(async (p) => {
+            const enriched = await enrichDlmmPool(p.address);
+            if (enriched) {
+              p.feeBps = enriched.feeBps;
+              p.binStep = enriched.binStep;
+              p.tvl = enriched.tvl;
+            }
+          })
+      );
+
+      return pools.sort((a, b) => b.tvl - a.tvl);
     } catch (err) {
       logger.error(`fetchPools error: ${err}`);
       return [];
@@ -184,6 +202,41 @@ function labelToPoolType(labels?: string[]): string {
   if (l.includes('DYN2')) return 'DAMM V2';
   if (l.includes('DYN')) return 'DAMM';
   return l[0] ?? 'Meteora';
+}
+
+interface MeteoraPoolDetail {
+  pool_config?: { bin_step: number; base_fee_pct: number };
+  tvl?: number;
+}
+
+/**
+ * Meteora DLMM data-API (dlmm.datapi.meteora.ag) отдаёт base_fee_pct в процентах
+ * (0.2 = 0.2%), а бот везде считает в bps (feeBps/100 = %) — переводим здесь.
+ */
+export function mapMeteoraPoolDetail(
+  detail: MeteoraPoolDetail | null | undefined
+): { feeBps: number; binStep: number; tvl: number } | null {
+  if (!detail?.pool_config) return null;
+  return {
+    feeBps: Math.round(detail.pool_config.base_fee_pct * 100),
+    binStep: detail.pool_config.bin_step,
+    tvl: detail.tvl ?? 0,
+  };
+}
+
+/** Реальные bin_step/fee/tvl одного DLMM-пула. null при ошибке/пуле не-DLMM. */
+async function enrichDlmmPool(
+  poolAddress: string
+): Promise<{ feeBps: number; binStep: number; tvl: number } | null> {
+  try {
+    const resp = await meteoraQ.get<MeteoraPoolDetail>(`${METEORA_POOL_DETAIL_API}/${poolAddress}`, {
+      timeout: 8000,
+    });
+    return mapMeteoraPoolDetail(resp.data);
+  } catch (err) {
+    logger.warn(`enrichDlmmPool failed for ${poolAddress}: ${err}`);
+    return null;
+  }
 }
 
 /**
