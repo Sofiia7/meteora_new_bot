@@ -16,6 +16,7 @@ import { logger } from '../../shared/logger';
 import { Positions } from '../../shared/repositories';
 import { PoolInfo, Position } from '../../shared/types';
 import { buildJupiterQuoteParams, buildJupiterSwapBody } from '../../shared/jupiter';
+import { stripComputeBudgetInstructions } from '../../shared/solana-tx';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -463,7 +464,10 @@ export class LpManager {
         const builtTx = new Transaction();
         builtTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
         builtTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
-        for (const ix of tx.instructions) builtTx.add(ix);
+        // DLMM SDK иногда сам добавляет свой ComputeBudget.setComputeUnitLimit
+        // (напр. initializePositionAndAddLiquidityByStrategy) — не дублируем,
+        // иначе runtime валит tx: "Transaction contains a duplicate instruction".
+        for (const ix of stripComputeBudgetInstructions(tx.instructions)) builtTx.add(ix);
         builtTx.recentBlockhash = blockhash;
         builtTx.feePayer = this.wallet.publicKey;
         builtTx.sign(this.wallet, ...extraSigners);
