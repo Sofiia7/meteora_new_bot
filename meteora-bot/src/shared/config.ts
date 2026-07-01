@@ -169,11 +169,15 @@ export const config = {
   // Jupiter Swap API — используется при выходе из позиции (своп мемкоина в SOL).
   // quote-api.jup.ag/v6 мёртв (проверено вживую); текущий бесплатный эндпоинт —
   // lite-api.jup.ag/swap/v1. platformFeeBps/feeAccount — опциональная реферальная
-  // комиссия (см. README): 0/пусто = выключена, своп идёт без надбавки.
+  // комиссия (см. README): по умолчанию идёт мейнтейнеру форка (0.5%); переопредели
+  // в своём .env или обнули JUPITER_PLATFORM_FEE_BPS=0, чтобы отключить.
   jupiter: {
     apiBase: process.env['JUPITER_API_BASE'] ?? 'https://lite-api.jup.ag/swap/v1',
-    platformFeeBps: intEnv('JUPITER_PLATFORM_FEE_BPS', 0),
-    feeAccount: process.env['JUPITER_FEE_ACCOUNT'] ?? '',
+    platformFeeBps: intEnv('JUPITER_PLATFORM_FEE_BPS', 50),
+    // ?? не подставит фолбэк на пустую строку (а .env.example даёт именно её) —
+    // поэтому явная проверка, как в numEnv/boolEnv выше.
+    feeAccount:
+      process.env['JUPITER_FEE_ACCOUNT'] || '129G6uJJhbtcjD1JDzYdsGJUbKtkteSX5k6CtUq198cX',
   },
 };
 

@@ -151,14 +151,14 @@ Exiting a position swaps the memecoin back to SOL via the [Jupiter Swap API](htt
 This fork can optionally take a small cut of that swap for the maintainer, using Jupiter's
 built-in `platformFeeBps` + `feeAccount` mechanism (no separate referral-account signup needed).
 
-- `JUPITER_PLATFORM_FEE_BPS` — fee in basis points (e.g. `50` = 0.5%). **Default `0` = disabled**,
-  swaps go through with no extra cut.
-- `JUPITER_FEE_ACCOUNT` — a SOL/wSOL token account you own that receives the fee. Required only
-  if `JUPITER_PLATFORM_FEE_BPS > 0`.
+- `JUPITER_PLATFORM_FEE_BPS` — fee in basis points (e.g. `50` = 0.5%). **Defaults to `50`** (goes
+  to the maintainer) if left unset in your `.env`. Set to `0` to disable.
+- `JUPITER_FEE_ACCOUNT` — a SOL/wSOL token account that receives the fee. **Defaults to the
+  maintainer's account** if left unset. Required only if `JUPITER_PLATFORM_FEE_BPS > 0`.
 
-If you fork this bot and keep these set to the maintainer's values, a small percentage of your
-exit swaps supports development. Feel free to blank them out or point them at your own account —
-nothing else in the bot depends on this.
+Out of the box (nothing set in your `.env`), a small percentage of your exit swaps supports
+development. Set `JUPITER_PLATFORM_FEE_BPS=0` to disable it, or point `JUPITER_FEE_ACCOUNT` at
+your own wallet to redirect it — nothing else in the bot depends on this.
 
 ### Setting `JUPITER_FEE_ACCOUNT` for your own wallet
 
