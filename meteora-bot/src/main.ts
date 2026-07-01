@@ -295,7 +295,25 @@ async function main(): Promise<void> {
   //
   // Здесь нужно вручную «оживить» watched_tokens(watching) — иначе пользователь
   // потеряет токены, которые бот ждал на момент падения.
-  const watchingRows = WatchedTokens.findWatching();
+  //
+  // Но: если строка провисела в 'watching' дольше MAX_TOKEN_AGE_DAYS (пользователь
+  // так и не нажал ни одну кнопку), это протухший watch, а не «то, что бот ждал».
+  // Без этой проверки такие токены (в т.ч. случайно попавшие blue-chip до фикса
+  // возрастного фильтра — JUP/MET/...) реанимировались бы и спамили заново на
+  // КАЖДОМ рестарте, потому что notifiedPoolAddrs у PoolWatcher живёт в памяти
+  // и обнуляется при каждом старте процесса.
+  const allWatchingRows = WatchedTokens.findWatching();
+  const maxAgeSec = config.scanner.maxTokenAgeDays * 24 * 60 * 60;
+  const nowSec = Date.now() / 1000;
+  const watchingRows = allWatchingRows.filter((w) => nowSec - w.startedAt <= maxAgeSec);
+  const staleRows = allWatchingRows.filter((w) => nowSec - w.startedAt > maxAgeSec);
+  for (const w of staleRows) {
+    logger.info(
+      `Recovery: dropping stale watch ${w.tokenSymbol} (${w.tokenAddress}), ` +
+        `older than ${config.scanner.maxTokenAgeDays}d`
+    );
+    WatchedTokens.cancel(w.tokenAddress);
+  }
   if (watchingRows.length > 0) {
     logger.info(`Recovery: restoring ${watchingRows.length} watched tokens`);
     for (const w of watchingRows) {
