@@ -18,6 +18,7 @@ process.env.MIN_GMGN_FEES_SOL = '30';
 // Пороги сканера — фиксируем для детерминизма тестов фильтров.
 process.env.MIN_MARKET_CAP = '250000';
 process.env.MIN_VOLUME_24H = '1000000';
+process.env.MAX_TOKEN_AGE_DAYS = '21';
 
 // БД в памяти — тесты mapper'а не трогают боевой data/bot.db.
 process.env.DB_PATH = ':memory:';

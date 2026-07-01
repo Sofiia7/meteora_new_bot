@@ -195,10 +195,15 @@ export class ScannerService {
  * chart-health (ATH/RSI/volume score) считается отдельно в ChartHealthAnalyzer
  * ПОСЛЕ сканера, чтобы тот же analyzer переиспользовался при ATH-re-notify.
  */
-export function passesScannerFilters(token: TokenInfo): boolean {
+export function passesScannerFilters(token: TokenInfo, now: number = Date.now()): boolean {
   if (token.marketCap < config.scanner.minMarketCap) return false;
   if (token.volume24h < config.scanner.minVolume24h) return false;
   if (token.chainId !== 'solana') return false;
+  // createdAt=0 = источник не знает возраст пары — не режем вслепую.
+  if (token.createdAt > 0) {
+    const ageDays = (now - token.createdAt) / (24 * 60 * 60 * 1000);
+    if (ageDays > config.scanner.maxTokenAgeDays) return false;
+  }
   return true;
 }
 

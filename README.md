@@ -160,6 +160,26 @@ If you fork this bot and keep these set to the maintainer's values, a small perc
 exit swaps supports development. Feel free to blank them out or point them at your own account —
 nothing else in the bot depends on this.
 
+### Setting `JUPITER_FEE_ACCOUNT` for your own wallet
+
+The fee is paid in **wSOL** (Wrapped SOL), which needs its own token account — most wallets
+don't have one by default, and Jupiter's swap UI auto-unwraps back to native SOL, so it won't
+create a persistent one for you. A helper script does it in one shot:
+
+```bash
+cd meteora-bot
+$env:WALLET_PRIVATE_KEY = "<base58 private key — Phantom → account → Show Private Key → Copy>"
+node scripts/create-fee-token-account.js
+Remove-Item Env:\WALLET_PRIVATE_KEY   # clear it from the terminal session when done
+```
+
+It prints the resulting address — copy that into `JUPITER_FEE_ACCOUNT`, restart the bot, done.
+Needs ~0.003 SOL in the wallet for rent + tx fee. Works with any wallet's key, no code changes.
+
+**Never paste a private key into a chat / issue / anywhere outside your own terminal** — the
+script only reads it from a local env var, once, and never logs or persists it. If a raw key
+does end up somewhere it shouldn't, treat that wallet as burned and move funds to a fresh one.
+
 ## ✅ Code quality
 
 ```bash

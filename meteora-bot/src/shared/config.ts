@@ -81,6 +81,9 @@ export const config = {
     intervalMs: intEnv('SCANNER_INTERVAL_MS', 300000),
     minMarketCap: intEnv('MIN_MARKET_CAP', 250000),
     minVolume24h: intEnv('MIN_VOLUME_24H', 1000000),
+    // Отсекает старые blue-chip пары (SOL-USDC, JUP, TRUMP...), которые иначе
+    // проходят по mcap/volume благодаря сетевому Meteora-источнику пулов.
+    maxTokenAgeDays: intEnv('MAX_TOKEN_AGE_DAYS', 21),
   },
   poolWatcher: {
     checkIntervalMs: intEnv('POOL_CHECK_INTERVAL_MS', 30000),
