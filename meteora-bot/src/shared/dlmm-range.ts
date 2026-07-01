@@ -27,29 +27,40 @@ export interface SingleSidedRange {
 }
 
 /**
- * Диапазон бинов для однонаправленного (только SOL) депозита — см. комментарий
- * в lp-manager.openPosition для обоснования направления (SOL=Y → выше active,
- * SOL=X → ниже active).
+ * Диапазон бинов для однонаправленного (только SOL) депозита.
+ *
+ * Направление определяется НЕ бизнес-логикой роста цены, а SDK: в
+ * @meteora-ag/dlmm (dist/index.js, toAmountBothSide) выбор bid/ask-стороны
+ * зависит только от положения диапазона относительно activeId, а не от
+ * strategyType (Spot/BidAsk/Curve) — это баг, который мы ловили две сессии
+ * подряд, меняя не то (price-domain, потом Spot→BidAsk), пока не прочитали
+ * сам SDK:
+ *   - диапазон ЦЕЛИКОМ ВЫШЕ activeId → toAmountAskSide → использует ТОЛЬКО
+ *     totalXAmount, totalYAmount молча игнорируется (уходит в 0 у всех бинов).
+ *   - диапазон ЦЕЛИКОМ НИЖЕ activeId → toAmountBidSide → использует ТОЛЬКО
+ *     totalYAmount, totalXAmount молча игнорируется.
+ * Поэтому депозит чистым Y (SOL=Y) обязан лежать НИЖЕ active, а депозит
+ * чистым X (SOL=X) — ВЫШЕ active. Раньше было ровно наоборот, отсюда
+ * totalXAmount/totalYAmount = 0 на реальных tx независимо от strategyType.
  */
 export function computeSingleSidedBinRange(input: SingleSidedRangeInput): SingleSidedRange {
-  const upperPriceMultiplier = 1 + input.priceRangeUpperPct / 100;
+  const rangeMultiplier = 1 + input.priceRangeUpperPct / 100;
 
   if (input.yIsSol) {
-    const minBinId = input.activeBinId + 1;
-    const upperBinId = binIdFromRawPrice(
-      input.rawActivePrice * upperPriceMultiplier,
+    const maxBinId = input.activeBinId - 1;
+    const lowerBinId = binIdFromRawPrice(
+      input.rawActivePrice / rangeMultiplier,
       input.binStep,
-      false
+      true
     );
-    return { minBinId, maxBinId: Math.max(upperBinId, minBinId) };
+    return { minBinId: Math.min(lowerBinId, maxBinId), maxBinId };
   }
 
-  const lowerPriceMultiplier = 1 / upperPriceMultiplier;
-  const maxBinId = input.activeBinId - 1;
-  const lowerBinId = binIdFromRawPrice(
-    input.rawActivePrice * lowerPriceMultiplier,
+  const minBinId = input.activeBinId + 1;
+  const upperBinId = binIdFromRawPrice(
+    input.rawActivePrice * rangeMultiplier,
     input.binStep,
-    true
+    false
   );
-  return { minBinId: Math.min(lowerBinId, maxBinId), maxBinId };
+  return { minBinId, maxBinId: Math.max(upperBinId, minBinId) };
 }

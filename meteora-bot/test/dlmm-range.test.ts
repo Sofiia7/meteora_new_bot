@@ -28,7 +28,15 @@ describe('computeSingleSidedBinRange', () => {
   const activeBinId = -234;
   const binStep = 100;
 
-  it('SOL=Y: диапазон activeBinId+1 .. далеко выше (не схлопывается в 1 бин)', () => {
+  // @meteora-ag/dlmm's toAmountBothSide (dist/index.js) picks the deposit side
+  // purely from range-vs-activeId position, ignoring strategyType: a range
+  // ENTIRELY ABOVE active uses toAmountAskSide (token X only, totalYAmount
+  // silently dropped); ENTIRELY BELOW active uses toAmountBidSide (token Y
+  // only, totalXAmount dropped). So a Y-only (SOL=Y) deposit must sit AT/BELOW
+  // active, and an X-only (SOL=X) deposit must sit AT/ABOVE active — the
+  // opposite of what this function computed before, which is why every
+  // single-sided open deposited 0 regardless of Spot vs BidAsk.
+  it('SOL=Y: диапазон далеко ниже .. activeBinId-1 (bid side, не схлопывается в 1 бин)', () => {
     const range = computeSingleSidedBinRange({
       activeBinId,
       rawActivePrice,
@@ -36,11 +44,11 @@ describe('computeSingleSidedBinRange', () => {
       yIsSol: true,
       priceRangeUpperPct: 100,
     });
-    expect(range.minBinId).toBe(activeBinId + 1);
-    expect(range.maxBinId).toBeGreaterThan(range.minBinId + 50); // ~70 бинов на +100% при binStep=100
+    expect(range.maxBinId).toBe(activeBinId - 1);
+    expect(range.minBinId).toBeLessThan(range.maxBinId - 50); // ~70 бинов на -100% при binStep=100
   });
 
-  it('SOL=X: диапазон далеко ниже .. activeBinId-1 (не схлопывается в 1 бин)', () => {
+  it('SOL=X: диапазон activeBinId+1 .. далеко выше (ask side, не схлопывается в 1 бин)', () => {
     const range = computeSingleSidedBinRange({
       activeBinId,
       rawActivePrice,
@@ -48,8 +56,8 @@ describe('computeSingleSidedBinRange', () => {
       yIsSol: false,
       priceRangeUpperPct: 100,
     });
-    expect(range.maxBinId).toBe(activeBinId - 1);
-    expect(range.minBinId).toBeLessThan(range.maxBinId - 50);
+    expect(range.minBinId).toBe(activeBinId + 1);
+    expect(range.maxBinId).toBeGreaterThan(range.minBinId + 50);
   });
 
   it('не даёт диапазону инвертироваться, если upperBinId вдруг <= minBinId', () => {
@@ -59,7 +67,7 @@ describe('computeSingleSidedBinRange', () => {
       activeBinId,
       rawActivePrice,
       binStep,
-      yIsSol: true,
+      yIsSol: false,
       priceRangeUpperPct: 0.0001,
     });
     expect(range.maxBinId).toBeGreaterThanOrEqual(range.minBinId);
