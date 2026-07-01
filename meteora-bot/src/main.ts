@@ -119,6 +119,17 @@ async function main(): Promise<void> {
   athWatcher.onRenotify(async (token, newAth, prevAth) => {
     await tgBot.notifyAthRenotify(token, newAth, prevAth);
     await processToken(token, '[ATH re-notify] ');
+
+    // poolWatcher.watch() внутри processToken молча выходит, если токен уже
+    // отслеживается (см. PoolWatcher.watch) — кнопки «Войти» не дублируются,
+    // и непонятно, куда тыкать при новом ATH. Пересылаем текущий список пулов
+    // явно, если пулы уже когда-то были найдены.
+    if (poolWatcher.isWatching(token.address)) {
+      const pools = await poolWatcher.fetchPools(token.address);
+      if (pools.length > 0) {
+        await tgBot.notifyPoolFound(token, pools);
+      }
+    }
   });
 
   // ─── Pool found → notify TG for confirmation ──────────────────────────────
