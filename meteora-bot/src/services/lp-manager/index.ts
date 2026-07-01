@@ -150,6 +150,13 @@ export class LpManager {
 
       const positionKp = Keypair.generate();
 
+      // Spot равномерно распределяет по диапазону вокруг active bin — для
+      // однонаправленного входа (диапазон ЦЕЛИКОМ по одну сторону от active,
+      // active в него не входит) это, похоже, вырождается в 0 у ончейн-стратегии
+      // (подтверждено на реальных tx: totalXAmount/totalYAmount = 0 у обеих
+      // сторон, при том что диапазон широкий и корректный). BidAsk — стратегия
+      // Meteora именно под концентрацию ликвидности на КРАЯХ диапазона
+      // (лимитники/односторонний вход), а не вокруг активного бина.
       const tx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
         positionPubKey: positionKp.publicKey,
         user: this.wallet.publicKey,
@@ -158,7 +165,7 @@ export class LpManager {
         strategy: {
           maxBinId,
           minBinId,
-          strategyType: StrategyType.Spot,
+          strategyType: StrategyType.BidAsk,
         },
       });
 
