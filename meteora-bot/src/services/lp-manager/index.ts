@@ -17,6 +17,7 @@ import { Positions } from '../../shared/repositories';
 import { PoolInfo, Position } from '../../shared/types';
 import { buildJupiterQuoteParams, buildJupiterSwapBody } from '../../shared/jupiter';
 import { stripComputeBudgetInstructions } from '../../shared/solana-tx';
+import { computeSingleSidedBinRange } from '../../shared/dlmm-range';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -104,6 +105,11 @@ export class LpManager {
 
       const activeBin = await dlmmPool.getActiveBin();
       const activeBinId = activeBin.binId;
+      // rawActivePrice — тот же (per-lamport, НЕ decimal-adjusted) домен, что
+      // ожидает getBinIdFromPrice/используется в bin-математике SDK. currentPrice
+      // (человеческая цена через fromPricePerLamport) — только для отображения/
+      // записи entryPrice, в bin-расчётах использовать нельзя (см. dlmm-range.ts).
+      const rawActivePrice = Number(activeBin.price);
       const currentPrice = parseFloat(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
 
       const solAmountLamports = Math.floor(config.lp.amountSol * LAMPORTS_PER_SOL);
@@ -128,28 +134,15 @@ export class LpManager {
       // верхнюю/нижнюю «полку», игнорируя priceRangeLower для single-sided
       // (защита −90% обеспечивается тем, что наш SOL автоматически
       // конвертируется в токен ПО ХОДУ роста, а не сразу).
-      const upperPriceMultiplier = 1 + config.lp.priceRangeUpper / 100;
-      const upperBinId = dlmmPool.getBinIdFromPrice(currentPrice * upperPriceMultiplier, false);
-
-      let minBinId: number;
-      let maxBinId: number;
-      let totalXAmount: BN;
-      let totalYAmount: BN;
-      if (yIsSol) {
-        // SOL = Y. Кладём Y, диапазон активный бин → upperBinId.
-        minBinId = activeBinId + 1;
-        maxBinId = Math.max(upperBinId, minBinId);
-        totalXAmount = new BN(0);
-        totalYAmount = new BN(solAmountLamports);
-      } else {
-        // SOL = X. Кладём X, диапазон lowerBinId → активный бин.
-        const lowerPriceMultiplier = 1 / upperPriceMultiplier; // зеркально
-        const lowerBinId = dlmmPool.getBinIdFromPrice(currentPrice * lowerPriceMultiplier, true);
-        maxBinId = activeBinId - 1;
-        minBinId = Math.min(lowerBinId, maxBinId);
-        totalXAmount = new BN(solAmountLamports);
-        totalYAmount = new BN(0);
-      }
+      const { minBinId, maxBinId } = computeSingleSidedBinRange({
+        activeBinId,
+        rawActivePrice,
+        binStep: dlmmPool.lbPair.binStep,
+        yIsSol,
+        priceRangeUpperPct: config.lp.priceRangeUpper,
+      });
+      const totalXAmount = yIsSol ? new BN(0) : new BN(solAmountLamports);
+      const totalYAmount = yIsSol ? new BN(solAmountLamports) : new BN(0);
 
       logger.info(
         `LP plan: SOL side=${yIsSol ? 'Y' : 'X'}, bins [${minBinId}..${maxBinId}], active=${activeBinId}`
